@@ -1,0 +1,580 @@
+---
+title: "Sample Construction"
+author: "Gustave Kenedi and Louis Sirugue"
+date: "`r Sys.time()`"
+format:
+  html:
+    toc: true
+    df-print: paged
+    embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+execute:
+  warning: false
+---
+
+## Packages
+
+```{r}
+packages <- c("here","tidyverse", "data.table", "furrr", "readxl", "janitor", "ggthemr", "furrr", "broom", "tidylog")
+librarian::shelf(packages, quiet = TRUE)
+rm(packages)
+```
+
+## Functions
+
+```{r}
+source(here("code_lib/useful_functions.R"))
+```
+
+## Params
+
+```{r}
+# figures
+fig_height = 6
+fig_width = (16/9)*fig_height
+ggthemr("pale")
+
+theme_update(text = element_text(size = 14),
+             legend.title = element_text(face = "italic", size = 12),
+             legend.text = element_text(size = 12),
+             legend.background = element_rect(fill = alpha("white", .75)),
+             plot.caption = element_text(size = 8, face = "italic", color = "#7d7d7d"))
+
+# no scientific notation
+options(scipen=999)
+
+# path to data
+data_path <- "~/Dropbox/3resources/data/psid/"
+```
+
+## Load data
+
+```{r}
+#| cache: true
+#| output: false
+
+# PSID variables dictionary
+psid_vars <- read_excel(paste0(data_path, "fims/psid.xlsx")) %>%
+  clean_names() %>%
+  mutate(var_id = 1:n()) %>% 
+  pivot_longer(cols = -c(var_id, type, category, text, head_wife, var_count),
+               names_prefix = "y",
+               names_to = "year",
+               values_to = "variable")
+
+# individual file
+ind_2019 <- fread(paste0(data_path, "ind2019er/IND2019ER.csv"))
+ind_2019 <- ind_2019 %>% 
+  mutate(fam_id_68 = ER30001,
+         person_num_68 = ER30002,
+         ind_id_68 = fam_id_68*1000 + person_num_68,
+         gender = case_when(ER32000 == 1 ~ "Male",
+                            ER32000 == 2 ~ "Female"))
+setDT(ind_2019)
+# fam_id_68 and person_num_68 uniquely identify every individual in the sample
+# my ind_id_68 variable uniquely identifies individuals
+ind_2019[, .N, by = list(fam_id_68, person_num_68)] %>% count(N)
+ind_2019[, .N, by = ind_id_68] %>% count(N)
+
+# income dataset created by income_data.qmd
+inc_all <- fread(here("data/inc_all.csv"))
+
+# family files 1968-20219
+years <- c(1968:1997, seq(1999, 2019, 2))
+for (i in years) {
+  print(i)
+  
+  if (i %in% 1968:1993) {
+    file_path <- paste0(data_path, "fam", i, "/FAM", i)
+  } else {
+    file_path <- paste0(data_path, "fam", i, "er", "/FAM", i, "ER")
+  }
+  
+  assign(paste0("fam_", i), fread(paste0(file_path, ".csv")))
+}
+
+gc()
+```
+
+------------------------------------------------------------------------
+
+## Family id + relation to head variables
+
+```{r}
+#| output: false
+
+# initiate variable used data.frame ----
+used_vars <- as_tibble(years)
+# -----
+
+# family interview id ----
+psid_vars %>% filter(var_id == 8746) %>% count(text)
+fam_id_vars <- psid_vars %>% filter(var_id == 8746) %>% pull(variable)
+used_vars <- bind_cols(used_vars, fam_id_vars = fam_id_vars)
+# ----
+
+# relation to head ----
+psid_vars %>% filter(var_id == 422) %>% count(text)
+rel_head_vars <- psid_vars %>% filter(var_id == 422) %>% pull(variable)
+used_vars <- bind_cols(used_vars, rel_head_vars = rel_head_vars)
+# ----
+```
+
+## Interview number, person number, sample/nonsample definitions
+
+```{r}
+#| output: false
+
+ind_2019 <- ind_2019 %>% 
+  mutate(itw_num_cat = case_when(ER30001 %in% 1:2930 ~ "Member of, or moved into, a family from the 1968 SRC cross-section sample",
+                                 ER30001 %in% 3001:3441 ~ "Member of, or moved into, a family from the Immigrant sample added in 1997",
+                                 ER30001 %in% 3442:3511 ~ "Member of, or moved into, a family from the Immigrant sample added in 1999",
+                                 ER30001 %in% 4001:4462 & ER32052 == 2017 ~ "Member of, or moved into, a family from the Immigrant sample added in 2017",
+                                 ER30001 %in% 4001:4462 & ER32052 == 2019 ~ "Multiplicity sample not interviewed until 2019",
+                                 ER30001 %in% 4700:4851 ~ "Member of, or moved into, a family from the Immigrant sample added in 2019",
+                                 ER30001 %in% 5001:6872 ~ "Member of, or moved into, a family from the 1968 Census sample",
+                                 ER30001 %in% 7001:9043 ~ "Member of, or moved into, a family from the Latino sample added in 1990",
+                                 ER30001 %in% 9044:9308 ~ "Member of, or moved into, a family from the Latino sample added in 1992"),
+         person_num_cat = case_when(ER30002 %in% 1:19 ~ "1. Individuals living in core sample families at the time of the 1968 interview; individuals living in Latino sample families at the time of the 1990 (or 1992) interview; individuals living in Immigrant sample families at the time of the 1997 (or 1999) or 2017 (or 2019) interview",
+                                    ER30002 %in% 20 ~ "Husband of a core sample 1968 Head living in an institution at the time of the 1968 interview; spouse of a Latino sample 1990 Head living in an institution at the time of the 1990 interview; spouse of an Immigrant sample 1997/1999 or 2017/2019 Head/Reference Person living in an institution at the time of the 1997/1999 or 2017/2019 interview",
+                                    ER30002 %in% 21:26 ~ "2. Children or stepchildren of a 1968 core sample Head who were under 25 and living in institutions at the time of the 1968 interview; children of a Latino sample 1990 (or 1992) Head who were under 25 and living in institutions at the time of the 1990 (or 1992) interview; children of an Immigrant sample 1997 (or 1999) or 2017 (or 2019) Head/Reference Person who were under 25 and living in institutions at the time of the 1997 (or 1999) or 2017 (or 2019) interview",
+                                    ER30002 %in% 30:169 ~ "3. Individuals born into the core sample since the 1968 interview, the Latino sample since the 1990 (or 1992) interview, or the Immigrant sample since the 1997 (or 1999) or 2017 (or 2019) interview and who have at least one sample parent; these persons are sample members",
+                                    ER30002 %in% 170:226 ~ "4. Individuals who moved into a core family for the first time after the 1968 interview or who have no sample parent; individuals from the Latino sample, other than the spouse of a 1990 (or 1992) Head, who moved out in the year preceding the 1990 (or 1992) interview or who moved in for the first time after the 1990 (or 1992) interview; individuals from the 97 Immigrant sample, other than the spouse of a 1997 (or 1999), who moved out in the year preceding the 1997 (or 1999) interview or who moved in for the first time after the 1997 (or 1999) interview; individuals from the 17 Immigrant sample, other than the spouse of a 2017 (or 2019) Head/Reference Person, who moved out in the year preceding the 2017 (or 2019) interview or who moved in for the first time after the 2017 (or 2019) interview.\nThese individuals are nonsample unless they were born after the initial wave and have at least one sample parent.",
+                                    ER30002 %in% 227 ~ "5. Spouse of a core sample 1968 Head who moved out in the year prior to the 1968 interview; spouse of a Latino sample 1990 Head who moved out in the year preceding the 1990 (or 1992) interview; spouse of an Immigrant sample 1997 (or 1999) Head who moved out in the year preceding the 1997 (or 1999) interview. Spouse of an Immigrant sample 2017 (or 2019) Reference Person who moved out in the year preceding the 2017 (or 2019) interview.\nThese individuals are nonsample.",
+                                    ER30002 %in% 228 ~ "6. Spouse of a core sample 1968 Head who died in the year prior to the 1968 interview; spouse of a Latino sample 1990 (or 1992) Head who died in the year prior to the 1990 (or 1992) interview; spouse of an Immigrant sample 1997 (or 1999) Head who died in the year prior to the 1997 (or 1999) interview; spouse of an Immigrant sample 2017 (or 2019) Reference Person who died in the year prior to the 2017 (or 2019) interview.\nThese individuals are nonsample.",
+                                    ER30002 %in% 229:399 ~ "7. Individuals who moved into a core family for the first time after the 1968 interview or who have no sample parent; individuals from the Latino sample, other than the spouse of a 1990 (or 1992) Head, who moved out in the year preceding the 1990 (or 1992) interview or who moved in for the first time after the 1990 (or 1992) interview; individuals from the 97 Immigrant sample, other than the spouse of a 1997 (or 1999) Head, who moved out in the year preceding the 1997 (or 1999) interview or who moved in for the first time after the 1997 (or 1999) interview; individuals from the 17 Immigrant sample, other than the spouse of a 2017 (or 2019) Reference Person, who moved out in the year preceding the 2017 (or 2019) interview or who moved in for the first time after the 2017 (or 2019) interview.\nThese individuals are nonsample unless they were born after the initial wave and have at least one sample parent. This series is simply a continuation of the 170-226 group."),
+         sample_status = case_when(ER32006 == 0 ~ "This individual is nonsample and not part of the elderly group",
+                                   ER32006 == 1 ~ "This individual is original sample",
+                                   ER32006 == 2 ~ "This individual is born-in sample",
+                                   ER32006 == 3 ~ "This individual is moved-in sample",
+                                   ER32006 == 4 ~ "This individual is joint inclusion sample",
+                                   ER32006 == 5 ~ "This individual was a followable nonsample parent",
+                                   ER32006 == 6 ~ "This individual is nonsample elderly"))
+
+ind_2019 %>% count(itw_num_cat, sort = T) %>% count_to_pct()
+ind_2019 %>% count(person_num_cat, sort = T) %>% count_to_pct()
+ind_2019 %>% count(sample_status, sort = T) %>% count_to_pct()
+```
+
+------------------------------------------------------------------------
+
+## Child sample
+
+Only keep individuals:
+
+(i) born between 1963 (56 in 2019, income measured at 55) and 1988 (31 in 2019, income measured at 30)
+(ii) observed as child (i.e., with parents) at least once
+(iii) observed at least once as head or spouse between 30 and 50 (i.e., we can observed their taxable family income)
+
+Following Chetty et al. (2014 QJE), for each child, we define parent(s) as the "reference person" and "spouse/partner" of the family unit in which the child is first observed. In the PSID, the child is often first observed at birth.
+
+Note that we don't restrict to children whose parent(s) has at least one family income observation because depending on the parent income variable the number of observations could vary.
+
+### Restriction (i): born between 1963-1988
+
+Since prior to 1983, only age (rather than birth year) was reported, we use the following rule to obtain individuals' birth year:
+
+1.  if at least 1 birth year value: most common value;
+
+2.  otherwise: most common value obtained from year - age (by definition this will equal birth year or birth year + 1).
+
+```{r}
+#| warning: false
+
+birth_year_min = 1963
+birth_year_max = 1988
+
+# obtain birth year of individuals
+# note: before 1983, only age was asked
+psid_vars %>% filter(var_id == 17) %>% count(text)
+age_vars <- psid_vars %>% filter(var_id == 17 & year < 1983) %>% pull(variable)
+age_vars
+used_vars <- bind_cols(used_vars, age_vars = c(age_vars, rep(NA, length(years) - length(age_vars))))
+
+psid_vars %>% filter(var_id == 15) %>% count(text)
+birth_year_vars <- psid_vars %>% filter(var_id == 15 & year %in% 1983:2019) %>% pull(variable)
+birth_year_vars
+used_vars <- bind_cols(used_vars, birth_year_vars = c(rep(NA, length(age_vars)), birth_year_vars))
+
+
+# replace "999" or "9999" values by missing
+sapply(ind_2019 %>% select(all_of(c(age_vars, birth_year_vars))), function(x) max(x, na.rm = T))
+sapply(ind_2019 %>% select(all_of(c(age_vars, birth_year_vars))), function(x) sum(x %in% c(999, 9999)))
+ind_2019_clean <- ind_2019 %>%
+  mutate(across(all_of(c(age_vars, birth_year_vars)), ~ ifelse(.x %in% c(999, 9999), NA, .x)))
+sapply(ind_2019_clean %>% select(all_of(c(age_vars, birth_year_vars))), function(x) max(x, na.rm = T))
+sapply(ind_2019_clean %>% select(all_of(c(age_vars, birth_year_vars))), function(x) sum(x %in% c(999, 9999)))
+
+# create birth_year_[YEAR] variables
+ind_2019_birth_dates <- bind_cols(ind_2019_clean %>% select(ind_id_68),
+                                  1:length(years[years < 1983]) %>% map_dfc(~ ind_2019_clean %>% 
+                                                                              select(all_of(age_vars)) %>%
+                                                                              mutate(!!paste0("birth_year_", years[.x]) := ifelse(.[[age_vars[.x]]] == 0, NA, years[.x] - .[[age_vars[.x]]])) %>%
+                                                                              select(starts_with("birth_year_"))),
+                                  1:length(c(1983:1997, seq(1999, 2019, 2))) %>% map_dfc(~ ind_2019_clean %>% 
+                                                                                           select(all_of(birth_year_vars)) %>%
+                                                                                           mutate(!!paste0("birth_year_", years[length(years[years < 1983])+.x]) := ifelse(.[[birth_year_vars[.x]]] == 0, NA, .[[birth_year_vars[.x]]])) %>%
+                                                                                           select(starts_with("birth_year_"))))
+ind_2019_birth_dates %>% head
+
+# pivot longer 
+ind_2019_birth_dates <- ind_2019_birth_dates %>%
+  pivot_longer(cols = -ind_id_68,
+               names_prefix = "birth_year_",
+               names_to = "year",
+               values_to = "birth_year")
+ind_2019_birth_dates %>% head
+ind_2019_birth_dates %>% count(birth_year) %>% count_to_pct()
+
+# use following rule to obtain birth year
+# if birth year observed after 1982, use most commonly observed value
+# otherwise use most commonly observed value
+ind_2019_birth_dates <- ind_2019_birth_dates %>%
+  filter(!is.na(birth_year)) %>% 
+  mutate(post_1982 = (year > 1982)) %>% 
+  group_by(ind_id_68, post_1982) %>% 
+  count(birth_year) %>% 
+  slice_max(order_by = n) %>% 
+  ungroup() %>% 
+  group_by(ind_id_68) %>% 
+  mutate(obs_post_1982 = (sum(post_1982) >= 1)) %>% 
+  ungroup
+ind_2019_birth_dates %>% head
+
+ind_2019_birth_dates <- bind_rows(ind_2019_birth_dates %>% 
+                                    filter(obs_post_1982 == T & post_1982 == T) %>% 
+                                    group_by(ind_id_68) %>% 
+                                    slice_max(order_by = n) %>% 
+                                    ungroup,
+                                  ind_2019_birth_dates %>% 
+                                    filter(obs_post_1982 == F) %>% 
+                                    group_by(ind_id_68) %>% 
+                                    slice_max(order_by = n) %>% 
+                                    ungroup)
+ind_2019_birth_dates %>% head
+
+setDT(ind_2019_birth_dates)
+
+ind_2019_birth_dates[, .N, by = ind_id_68] %>% count(N) %>% count_to_pct()
+# a bit less than 2% of individuals report different birth years with equal frequency which is a bit strange
+ind_2019_birth_dates[, n_obs := .N, by = ind_id_68]
+ind_2019_birth_dates[n_obs > 1] %>% head
+
+# randomly pick one, doesn't matter that much
+ind_2019_birth_dates[, id := 1:n_obs, by = ind_id_68]
+ind_2019_birth_dates <- ind_2019_birth_dates[id == 1]
+ind_2019_birth_dates %>% count(birth_year)
+ind_2019_birth_dates[, .N, by = ind_id_68] %>% count(N)
+ind_2019_birth_dates %>% summarise(n_distinct(ind_id_68))
+
+# add birth_year variable to ind_2019
+ind_2019_clean <- ind_2019_clean %>% 
+  left_join(ind_2019_birth_dates %>% select(ind_id_68, birth_year))
+rm(ind_2019_birth_dates)
+ind_2019_clean %>% count(birth_year)
+ind_2019_clean %>% count(is.na(birth_year)) %>% count_to_pct() # missing birth year for 1.2% of individuals
+sapply(ind_2019_clean[is.na(birth_year)] %>% select(all_of(c(age_vars, birth_year_vars))), function(x) sum(x == 0 | is.na(x)))
+ind_2019_clean[is.na(birth_year)] %>% count(itw_num_cat, sort = T)
+ind_2019_clean[is.na(birth_year)] %>% count(person_num_cat, sort = T)
+
+# keep only individuals born in 1963-1988
+# n obs.: 30,186
+child_sample <- ind_2019_clean[birth_year %in% birth_year_min:birth_year_max]
+child_sample %>% count()
+child_sample %>%
+  count(birth_year) |> 
+  ggplot(aes(x = birth_year, y = n)) +
+  geom_col() +
+  geom_text(aes(label = n), vjust = -1) +
+  labs(x = "Birth year", y = "Frequency") +
+  scale_x_continuous(breaks = seq(1963, 1988, 5), expand = c(0.01,0.01)) +
+  scale_y_continuous(lim = c(0, 1350), breaks = seq(0, 1250, 250), expand = c(0,0))
+```
+
+### Restriction (ii): observed as child (i.e., with parents) at least once
+
+-   should we restrict to some age at which individual is observed as child, perhaps less than 17? $\rightarrow$ 89.6% are first observed as child at age 17 or less (42% are first observed at age 0 or 1), so probably not that important
+
+```{r}
+# keep only individuals who were observed at least once as children
+# identify children
+ind_2019_child <- ind_2019_clean %>% 
+  select(ind_id_68, all_of(rel_head_vars))  %>% 
+  pivot_longer(cols = -ind_id_68,
+               names_to = "relation_to_head_var",
+               values_to = "relation_to_head") %>% 
+  mutate(year = rep(years, n()/length(years)))
+setDT(ind_2019_child)
+ind_2019_child[relation_to_head != 0] %>% count(substr(relation_to_head,1,1), sort = T) %>% count_to_pct()
+
+# children: 1-digit relation to head == 3
+# and obtain age at which first observed as child
+ind_2019_child <- ind_2019_child %>%
+  filter(substr(relation_to_head, 1, 1) == 3) %>% 
+  left_join(child_sample %>% select(ind_id_68, birth_year)) %>% 
+  mutate(age = year - birth_year) %>% 
+  group_by(ind_id_68) %>% 
+  slice_min(order_by = age) %>% 
+  ungroup
+
+# plot distribution of age at which child is first observed as child
+ind_2019_child %>% 
+  group_by(age) %>% 
+  summarise(n_obs = n()) %>% 
+  mutate(pct = n_obs/sum(n_obs)) %>% 
+  ggplot(aes(x = age, y = n_obs)) +
+  geom_col(color = "white") +
+  geom_text(aes(y = n_obs + 150, label = paste0(round(pct*100,0), "%"))) +
+  scale_x_continuous(breaks = seq(0,100,5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(expand = c(0.01, 0.01), labels = scales::comma) +
+  labs(x = "Age at which first observed as child",
+       y = "Frequency",
+       caption = paste0("Sample: individuals born ", birth_year_min, "-", birth_year_max, ".
+       Observed as child: 1st digit of relation to head = 3.
+       Source: PSID (2022)"),
+       title = "Age at which individual sample is first observed as child")
+ind_2019_child |> count(age <= 17) |> count_to_pct()
+
+# n obs.: 18,612
+child_sample <- child_sample %>% 
+  filter(ind_id_68 %in% ind_2019_child$ind_id_68)
+child_sample %>% count()
+child_sample %>% count(birth_year)
+rm(ind_2019_child)
+
+# plot distribution of birth years
+child_sample %>%
+  ggplot(aes(x = birth_year)) +
+  geom_histogram(binwidth = 1, color = "white") +
+  scale_x_continuous(lim = c(1962, 1989), breaks = seq(1960, 1995, 5), expand = c(0,0)) +
+  scale_y_continuous(lim = c(0, 900), breaks = seq(0, 900, 200), expand = c(0,0)) +
+  labs(x = "Birth year",
+       y = "Frequency",
+       caption = "Sample: individuals born 1963-1988 and observed at least once as children (i.e., 1st digit of relation to head = 3).
+       Source: PSID (2022)") +
+  theme(plot.margin = unit(c(6,20,6,6), "points"))
+```
+
+### Restriction (iii): observed at least once as reference person or spouse/partner between 30 and 50
+
+$\rightarrow$ so their incomes in adulthood can be measured
+
+NB: "Individuals moving in or born subsequent to the \[YEAR\] interview received the \[YEAR\] ID number of the family into which they moved."
+
+IMPORTANT: only 34.6% of children are observed at least once as head or spouse between 25 and 55. How come? Most likely due to the nature PSID samples.
+
+```{r}
+age_min = 30
+age_max = 50
+
+# family interview number
+psid_vars %>% filter(var_id == 419) %>% count(text)
+itw_num_vars <- psid_vars %>% filter(var_id == 419) %>% pull(variable)
+used_vars <- bind_cols(used_vars, itw_num_vars = itw_num_vars)
+
+# sequence number
+seq_num_vars <- psid_vars %>% filter(var_id == "426") %>% pull(variable)
+used_vars <- bind_cols(used_vars, seq_num_vars = seq_num_vars)
+seq_num_vars <- seq_num_vars[!is.na(seq_num_vars)]
+
+# obtain family interview number and position relative to head
+child_sample_long <- ind_2019_clean %>%
+  filter(ind_id_68 %in% child_sample$ind_id_68) %>% 
+  select(ind_id_68, birth_year, gender, all_of(c(itw_num_vars, rel_head_vars, seq_num_vars))) %>%
+  rename_with(~ map2_chr(itw_num_vars, years, ~ paste0(.x, "_itw_", .y)), all_of(itw_num_vars)) %>%
+  rename_with(~ map2_chr(rel_head_vars, years, ~ paste0(.x, "_rel_", .y)), all_of(rel_head_vars)) %>%
+  rename_with(~ map2_chr(seq_num_vars, years[years != 1968], ~ paste0(.x, "_seq_", .y)), all_of(seq_num_vars)) %>%
+  pivot_longer(cols = -c(ind_id_68, birth_year, gender),
+               names_to = c(".value", "year"),
+               names_pattern = ".(itw|rel|seq)_(\\d+)") %>% 
+  rename(itw_num = itw,
+         rel_head = rel,
+         seq_num = seq) %>% 
+  mutate(year = as.numeric(year),
+         age = year - birth_year)
+child_sample_long %>% head
+
+# head or spouse between ages 30-50
+ind_2019_child <- child_sample_long %>% 
+  filter(age %in% age_min:age_max & substr(rel_head, 1, 1) %in% 1:2) %>% 
+  pull(ind_id_68) %>% unique()
+
+# identify individuals in child sample observed at least once as head or spouse between ages 30-50
+# only 30.4%
+child_sample %>% count(ind_id_68 %in% ind_2019_child) %>% count_to_pct()
+setDT(child_sample)
+child_sample[, obs_head_spouse := (ind_id_68 %in% ind_2019_child)]
+child_sample[obs_head_spouse == F] %>% count(itw_num_cat, sort = T) %>% count_to_pct()
+child_sample[obs_head_spouse == F] %>% count(person_num_cat, sort = T) %>% count_to_pct()
+child_sample[obs_head_spouse == F] %>% count(sample_status, sort = T) %>% count_to_pct() # 37% of missing are original sample
+
+child_sample[obs_head_spouse == F] %>% count(ER32008, sort = T) %>% count_to_pct()
+# at what age was the individual's first non response (among individuals who were not never nonresponse)
+# 89% prior to age 25
+child_sample[obs_head_spouse == F & !ER32008 %in% 0:4] %>% count((ER32008 - birth_year) < 25) %>% count_to_pct()
+
+# merge taxable income to long df
+child_sample_long <- child_sample_long %>% 
+  left_join(inc_all, by = c("year" = "year_psid", "itw_num"))
+
+# obtain sample/non-sample status
+child_sample_long <- child_sample_long %>% 
+  left_join(ind_2019_clean %>% select(ind_id_68, sample_status))
+child_sample_long %>%
+  filter(age %in% age_min:age_max) %>% 
+  group_by(ind_id_68, sample_status) %>%
+  summarise(n_head_spouse = sum(substr(rel_head, 1, 1) %in% 1:2)) %>%
+  ungroup() %>%
+  filter(n_head_spouse == 0) %>% 
+  count(sample_status, sort = T) %>% count_to_pct()
+# plot % by birth year
+child_sample %>%
+  group_by(ind_id_68, birth_year, gender) %>%
+  group_by(birth_year) %>%
+  summarise(inc_obs_pct = mean(obs_head_spouse)) %>% 
+  ggplot(aes(x = birth_year, y = inc_obs_pct)) +
+  geom_col() +
+  labs(x = "Birth year",
+       y = paste0("% observed as head/spouse ", age_min, "-", age_max),
+       caption = paste0("Children ", birth_year_min, "-", birth_year_max, " observed at least once as head or wife at ", age_min, "-", age_max, ".")) +
+  scale_y_continuous(lim = c(0,.5), labels = scales::percent, expand = c(0, 0))
+
+# keep only children observed as head or spouse at ages 30-50
+child_sample <- child_sample[obs_head_spouse == T]
+child_sample %>% count()
+```
+
+### Cleaned child data.frame
+
+```{r}
+# create dataframe with only cleaned variables
+child_sample_clean <- child_sample %>% 
+  select(ind_id_68, gender, birth_year, itw_num_cat, person_num_cat, sample_status)
+child_sample_clean %>% count(sample_status, sort = T) %>% count_to_pct()
+```
+
+### Identify parents
+
+Follow Chetty et al. (2014 QJE): *parents are first family unit in which child is observed, then follow parents' family taxable income.*
+
+Note that this differs from:\
+$\rightarrow$ Mazumder (2016), who uses the PSID's Family Identification Mapping System (FIMS) to identify fathers.\
+$\rightarrow$ Lee and Solon (2009) use the family taxable income in which the children find themselves between ages 15 and 17. This may potentially be overly restrictive in case some children are observed only prior to age 15.
+
+Alternative way to define parents: heads and spouses in which child is observed $\rightarrow$ problem this prevents identifying parent income once the child becomes a head of household.
+
+(As a robustness, we could identify parents observed with children at a given age.)
+
+```{r}
+# identify family id in which child is first observed
+setDT(child_sample_long)
+child_first_fam <- child_sample_long[ind_id_68 %in% child_sample_clean$ind_id_68] %>%
+  select(ind_id_68, birth_year, gender, year, itw_num, rel_head, age) %>% 
+  filter(substr(rel_head, 1, 1) == 3) %>% 
+  group_by(ind_id_68) %>% 
+  slice_min(order_by = year) %>% 
+  ungroup()
+setDT(child_first_fam)
+child_first_fam[, .N, by = ind_id_68] %>% count(N)
+
+# I add a variable in seq_num_vars because sequence number does not exist for 1968 by definition, and this prevents me from using the simple code below. I'll then recode values for 1968 sequence number.
+seq_num_vars <- c("ER30000", seq_num_vars)
+
+# obtain first family reference head and spouse identifiers
+child_first_parents <- child_first_fam %>%
+  select(child_fam = ind_id_68, birth_year, gender, year, itw_num, age) %>% 
+  left_join(var_reshape_fct(ind_2019,
+                            set_var_names = list(itw_num_vars, rel_head_vars, seq_num_vars),
+                            names_to_new = c("itw_num_vars", "rel_head_vars", "seq_num_vars"),
+                            values_to_new = c("itw_num", "rel_to_head", "seq_num")) %>%
+              select(ind_id_68, year, itw_num, rel_to_head, seq_num) %>% 
+              mutate(seq_num = ifelse(year == 1968, NA, seq_num)), by = c("itw_num", "year")) %>% 
+  filter(substr(rel_to_head, 1, 1) %in% 1:2) %>%
+  select(ind_id_68, year, rel_to_head, seq_num, gender, child_fam) %>% 
+  arrange(child_fam)
+setDT(child_first_parents)
+
+# <2% have 2 heads
+# this is because the relation to head variable is relative to the head in year t-1
+# therefore some former heads may have moved out of the FU
+child_first_parents %>%
+  group_by(child_fam) %>%
+  summarise(n_head = sum(substr(rel_to_head, 1, 1) == 1)) %>%
+  ungroup() %>% count(n_head) %>% count_to_pct()
+
+child_first_parents <- child_first_parents %>%
+  group_by(child_fam) %>%
+  mutate(n_head = sum(substr(rel_to_head, 1, 1) == 1)) %>% 
+  ungroup()
+
+child_first_parents %>% filter(n_head > 1) %>% count(seq_num)
+child_first_parents %>% filter(n_head > 1) %>% count(year, sort = T)
+
+# keep only parents that were in the family at the time of the interview
+# i.e., 1-digit of sequence number = 1:2
+# or who are observed in 1968 (who by definition are in the family unit)
+child_first_parents <- child_first_parents %>% 
+  filter(year == 1968 | substr(seq_num, 1, 1) %in% 1:2)
+child_first_parents %>% summarise(n_distinct(child_fam))
+
+# all children have well identified parents!
+child_first_parents %>%
+  group_by(child_fam) %>%
+  summarise(n_head = sum(substr(rel_to_head, 1, 1) == 1)) %>% count(n_head)
+
+# 20% of children are observed with only one parent
+child_first_parents %>%
+  group_by(child_fam) %>%
+  summarise(n_parents = n()) %>% ungroup() %>%
+  count(n_parents) %>% count_to_pct()
+
+# create long dataframe of parents'
+parents_sample <- ind_2019_clean[ind_id_68 %in% child_first_parents$ind_id_68]
+parents_sample_long <- parents_sample %>%
+  select(ind_id_68, birth_year, gender, all_of(c(itw_num_vars, rel_head_vars))) %>% 
+  rename_with(~ map2_chr(itw_num_vars, years, ~ paste0(.x, "_itw_", .y)), all_of(itw_num_vars)) %>%
+  rename_with(~ map2_chr(rel_head_vars, years, ~ paste0(.x, "_rel_", .y)), all_of(rel_head_vars)) %>%
+  pivot_longer(cols = -c(ind_id_68, gender, birth_year),
+               names_to = c(".value", "year"),
+               names_pattern = ".(itw|rel)_(\\d+)") %>%
+  rename(itw_num = itw,
+         rel_head = rel) %>% 
+  mutate(year = as.numeric(year),
+         age = year - birth_year)
+setDT(parents_sample_long)
+
+# now that I have the parents' identifier, obtain their incomes when they are reference or spouse
+parents_sample_long <- parents_sample_long %>% 
+  left_join(inc_all, by = c("year" = "year_psid", "itw_num"))
+  
+# clean parents data.frame
+parents_sample_clean <- parents_sample %>% 
+  select(ind_id_68, birth_year, gender, itw_num_cat, person_num_cat, sample_status)
+```
+
+## Display and export used variables
+
+```{r}
+used_vars
+fwrite(used_vars, here("data/used_vars_sample.csv"))
+```
+
+## Export intermediate datasets
+
+```{r}
+fwrite(child_first_parents, here("data/child_first_parents.csv"))
+fwrite(parents_sample, here("data/parents_sample.csv"))
+fwrite(parents_sample_clean, here("data/parents_sample_clean.csv"))
+fwrite(parents_sample_long, here("data/parents_sample_long.csv"))
+fwrite(child_sample, here("data/child_sample.csv"))
+fwrite(child_sample_clean, here("data/child_sample_clean.csv"))
+fwrite(child_sample_long, here("data/child_sample_long.csv"))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

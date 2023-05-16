@@ -1,0 +1,574 @@
+---
+title: "PSID Descriptive Statistics"
+author: "Gustave Kenedi and Louis Sirugue"
+date: "`r Sys.time()`"
+format:
+  html:
+    toc: true
+    df-print: paged
+    embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+execute:
+  warning: false
+---
+
+## Packages
+
+```{r}
+packages <- c("here", "tidyverse", "data.table", "readxl", "janitor", "ggthemr", "patchwork", "ggtext", "kableExtra", "tidylog", "scico")
+librarian::shelf(packages, quiet = TRUE)
+rm(packages)
+```
+
+## Functions
+
+```{r}
+source(here("code_lib", "useful_functions.R"))
+source(here("code_lib", "inc_fct.R"))
+```
+
+## Params
+
+```{r}
+# figures
+fig_height = 6
+fig_width = (16/9)*fig_height
+ggthemr("pale")
+
+text_size = 14
+title_size = 13
+
+theme_update(text = element_text(size = text_size),
+             plot.title = element_text(size = title_size, face = "italic"),
+             legend.title = element_text(face = "italic", size = 12),
+             legend.text = element_text(size = 12),
+             legend.background = element_rect(fill = alpha("white", .75)),
+             plot.caption = element_text(size = 10, face = "italic", color = "#7d7d7d"),
+             strip.text = element_text(size = 11, face = "plain"))
+
+alpha = 0.8
+my_palette = scico(5, palette = "lajolla", begin = .2, end = .95)
+
+# no scientific notation
+options(scipen=999)
+
+# path to data
+data_path <- "~/Dropbox/3resources/data/psid/"
+figure_path <- "/Users/gustave/Dropbox/Apps/Overleaf/Intergenerational Income Mobility/psid_validation/figures/"
+```
+
+## Import intermediate datasets
+
+```{r}
+# PSID variables dictionary
+psid_vars <- read_excel(paste0(data_path, "fims/psid.xlsx")) %>%
+  clean_names() %>%
+  mutate(var_id = 1:n()) %>% 
+  pivot_longer(cols = -c(var_id, type, category, text, head_wife, var_count),
+               names_prefix = "y",
+               names_to = "year",
+               values_to = "variable")
+setDT(psid_vars)
+
+# state-region correspondance table
+state_correspondance <- fread(here("data/state_correspondance.csv"))
+
+parents_sample <- fread(here("data/parents_sample.csv"))
+parents_sample_clean <- fread(here("data/parents_sample_clean_results.csv"))
+parents_sample_clean <- parents_sample_clean %>% 
+  mutate(across(where(is.character), ~ ifelse(. == "", NA, .)))
+parents_sample_long <- fread(here("data/parents_sample_long.csv"))
+
+# child_sample <- fread(here("out/data/child_sample.csv"))
+child_sample_clean <- fread(here("data/child_sample_clean_results.csv"))
+child_sample_clean <- child_sample_clean %>%
+  left_join(state_correspondance, by = c("state" = "state_code"))
+child_sample_long <- fread(here("data/child_sample_long.csv"))
+
+# child-parent links
+child_first_parents <- fread(here("data", "child_first_parents.csv")) %>% 
+  rename(ind_id_68_child = child_fam) %>% 
+  select(ind_id_68, ind_id_68_child, rel_to_head, gender)
+
+# obtain children's id
+parents_sample_clean_withchildren <- parents_sample_clean %>% 
+  left_join(child_first_parents %>% select(ind_id_68, ind_id_68_child))
+```
+
+## Descriptive stats on children
+
+### Number of observations per birth year
+
+```{r}
+child_sample_clean |> 
+  count(birth_year) |> 
+  ggplot(aes(x = birth_year, y = n)) +
+  geom_col() +
+  geom_text(aes(label = n), vjust = -1) +
+  scale_x_continuous(breaks = seq(1963, 1988, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(lim = c(0,300), expand = c(0, 0)) +
+  labs(x = "Birth year",
+       y = "Frequency")
+```
+
+### Generate family total income variable
+
+```{r}
+# drop age and income variables
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+
+# at least one family income obs. by birth year
+child_sample_clean <- child_sample_clean %>%
+  left_join(inc_fct(dt = child_sample_long,
+                    inc_var = "family total income",
+                    age_range = 30:50))
+
+# replace missing num obs by 0
+child_sample_clean <- child_sample_clean |> 
+  mutate(across(contains("n_family") & !contains("mean"), ~ ifelse(is.na(.), 0, .)))
+```
+
+### At least one family total income obs. by birth year
+
+```{r}
+child_sample_clean %>% 
+  ggplot(aes(x = birth_year, fill = !is.na(mean_family_total_income_real_3050))) +
+  geom_bar(position = "fill") +
+  scale_x_continuous(breaks = seq(1963, 1988, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(lim = c(0, 1), breaks = seq(0, 1, .2), expand = c(0, 0), labels = scales::percent) +
+  labs(x = "Birth year",
+       y = "Frequency",
+       fill = "At least one family total income obs. 30-50",
+       caption = "Sample: 1963-1988 cohorts, observed at least once as children with parents and\nat least once as reference person or partner at 30-50.") +
+  theme(legend.position = "top") +
+  guides(fill = guide_legend(reverse = T))
+```
+
+### Number of family total income obs. by birth year
+
+```{r}
+# % of no income obs by birth year
+child_sample_clean %>%
+  group_by(birth_year) %>% 
+  summarise(missing_3050 = mean(n_family_total_income_real_3050 == 0)) %>% 
+  ggplot(aes(x = birth_year, y = missing_3050)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(missing_3050*100, 2), "%")), vjust = -1) +
+  labs(x = "Birth year",
+       y = "% no family total income obs. 30-50",
+       caption = "Sample: 1963-1988 cohorts, observed at least once as children with parents and\nat least once as reference person or partner at 30-50.") +
+  scale_x_continuous(breaks = seq(1963, 1988, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(lim = c(0, .26), expand = c(0,0), labels = scales::percent)
+
+# graph of number of child income observations
+pct_n_inc <- child_sample_clean %>% count(n_family_total_income_real_3050) %>% count_to_pct()
+
+child_sample_clean %>%
+  group_by(birth_year, n_family_total_income_real_3050) %>% 
+  summarise(n_obs = n()) %>% 
+  left_join(pct_n_inc) %>% 
+  mutate(n_family_inc_with_pct = paste0(n_family_total_income_real_3050, " (", round(pct*100,1), "%)")) %>% 
+  ggplot(aes(x = birth_year, y = n_obs, fill = fct_reorder(n_family_inc_with_pct, -n_family_total_income_real_3050))) +
+  geom_col(position = "fill") +
+  scale_fill_scico_d(palette = "lajolla", begin = .2, end = .95, direction = -1) +
+  scale_x_continuous(breaks = seq(1963, 1988, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(breaks = seq(0, 1, .2), labels = scales::percent, expand = c(0,0)) +
+  labs(x = "Birth year",
+       y = "Number of family total income observations",
+       fill = "Number of obs.",
+       caption = "Sample: 1963-1988 cohorts, observed at least once as children with parents and\nat least once as reference person or partner at 30-50.") +
+  guides(fill = guide_legend(ncol = 1))
+
+# by gender
+child_sample_clean %>%
+  group_by(birth_year, gender, n_family_total_income_real_3050) %>% 
+  summarise(n_obs = n()) %>% 
+  left_join(pct_n_inc) %>% 
+  mutate(n_family_inc_with_pct = paste0(n_family_total_income_real_3050, " (", round(pct*100,1), "%)")) %>% 
+  ggplot(aes(x = birth_year, y = n_obs, fill = fct_reorder(n_family_inc_with_pct, -n_family_total_income_real_3050))) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(vars(gender)) +
+  scale_fill_scico_d(palette = "lajolla", begin = .2, end = .95, direction = -1) +
+  scale_x_continuous(breaks = seq(1963, 1988, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(breaks = seq(0, 1, .2), labels = scales::percent, expand = c(0,0)) +
+  labs(x = "Birth year",
+       y = "Number of family total income observations",
+       fill = "Number of obs.",
+       caption = "Sample: 1963-1988 cohorts, observed at least once as children with parents and\nat least once as reference person or partner at 30-50.") +
+  guides(fill = guide_legend(ncol = 1))
+```
+
+## Descriptive stats on parents
+
+2 potential samples of parents:
+
+\(i\) parents of children born 1963-1988, and
+
+\(ii\) parents of children born 1963-1988 who are also observed at least once at ages 30-50.
+
+For the moment I focus only on (ii). (i) can be added as a robustness check at some point.
+
+```{r}
+# 5,785 parents
+parents_sample_clean %>% count()
+
+# 3,135 mothers, 2,650 fathers
+parents_sample_clean %>% count(gender)
+```
+
+### Birth year and age at child birth year
+
+```{r}
+# all parents
+parents_sample_clean |> 
+  ggplot(aes(x = birth_year)) +
+  geom_bar() +
+  scale_x_continuous(expand = c(0.01,0.01)) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = "Birth year",
+       y = "Frequency",
+       title = "Birth year")
+
+# by gender
+parents_sample_clean |> 
+  ggplot(aes(x = birth_year)) +
+  geom_bar() +
+  facet_wrap(~ gender) +
+  scale_x_continuous(expand = c(0.01,0.01)) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = "Birth year",
+       y = "Frequency",
+       title = "Birth year by gender")
+
+# age at child birth
+parents_sample_clean_withchildren |>
+  left_join(child_sample_clean |> select(ind_id_68_child = ind_id_68, birth_year_child = birth_year)) |> 
+  mutate(age_at_child_birth = birth_year_child - birth_year) |> 
+  ggplot(aes(x = age_at_child_birth)) +
+  geom_bar() +
+  facet_wrap(~ gender) +
+  scale_x_continuous(breaks = seq(10,70,5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(x = "Age at child birth",
+       y = "Frequency",
+       title = "Age at child birth") +
+  theme(panel.spacing.x = unit(2, "lines"))
+```
+
+### Education
+
+Missing for 52 parents (0.9%)
+
+```{r}
+# education levels
+# missing for 52 parents
+parents_sample_clean %>% count(edu_level) %>% count_to_pct()
+
+# check whether there is maybe something wrong in code: no! all observations with missing edu_level have grades completed variables equal to 0 or 99 -> indeed not available (individual from Immigrant or Latino samples most likely)
+edu_vars <- psid_vars %>% filter(var_id == 65 & !is.na(variable)) %>% pull(variable)
+parents_sample[ind_id_68 %in% (parents_sample_clean[is.na(edu_level)] %>% pull(ind_id_68))] %>%
+  select(all_of(edu_vars)) %>%
+  pivot_longer(cols = everything(),names_to = "var", values_to = "value") %>%
+  count(value) %>% count_to_pct()
+
+# % of parents by education level
+parents_sample_clean %>%
+  mutate(edu_level = factor(edu_level, levels = c("Grades 1-5", "Grades 6-8", "Grades 9-11", "Grade 12 (HS completion)", "Some college / associate degree", "College degree", "Advanced college degree"))) |> 
+           count(edu_level) |> count_to_pct()
+
+# % of parents by education level - by gender
+parents_sample_clean %>%
+  mutate(edu_level = factor(edu_level, levels = c("Grades 1-5", "Grades 6-8", "Grades 9-11", "Grade 12 (HS completion)", "Some college / associate degree", "College degree", "Advanced college degree"))) |> 
+  group_by(gender, edu_level) |> 
+  summarise(n_obs = n()) |> 
+  group_by(gender) |> 
+  mutate(pct = n_obs/sum(n_obs))
+```
+
+### Occupation
+
+Missing for 413 parents (7.14%).
+
+```{r}
+# missing occupation at 30-50 for 7% of parents
+parents_sample_clean %>% count(is.na(occ_3_digit_3050)) %>% count_to_pct()
+
+# more frequently missing for men (9% vs. 5.5%)
+parents_sample_clean %>% group_by(gender) |> summarise(mean(is.na(occ_3_digit_3050)))
+
+# check whether there is maybe something wrong in code: no! all observations with missing edu_level have grades completed variables equal to 0 or 99 -> indeed not available (individual from Immigrant or Latino samples most likely)
+edu_vars <- psid_vars %>% filter(var_id == 65 & !is.na(variable)) %>% pull(variable)
+parents_sample[ind_id_68 %in% (parents_sample_clean[is.na(edu_level)] %>% pull(ind_id_68))] %>%
+  select(all_of(edu_vars)) %>%
+  pivot_longer(cols = everything(),names_to = "var", values_to = "value") %>%
+  count(value) %>% count_to_pct()
+```
+
+### Race
+
+Missing for 63 parents (1.09%).
+
+```{r}
+# missing race for 1.09% of parents
+parents_sample_clean %>% count(is.na(race)) %>% count_to_pct()
+```
+
+### Region
+
+Missing for 296 parents (5.1%).
+
+```{r}
+# missing state at 30-50 for 5% of parents
+parents_sample_clean %>% count(is.na(state)) %>% count_to_pct()
+```
+
+### Income
+
+```{r}
+# income definitions
+inc_vars = c("labor income", "family total income")
+
+# minimum and maximum parent age at income observation
+parent_age_min = 30
+parent_age_max = 50
+
+parents_sample_clean <- parents_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+
+# generate income variables
+parents_sample_clean <- parents_sample_clean %>% 
+  left_join(inc_vars %>% 
+              map(~ inc_fct(dt = parents_sample_long,
+                            inc_var = .x,
+                            age_range = parent_age_min:parent_age_max) %>% 
+                    select(-contains("age"))) %>%
+              reduce(full_join, by = "ind_id_68")) |> 
+  mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .)))
+parents_sample_clean %>% names
+
+# % of no income obs by birth year
+parents_sample_clean %>%
+  group_by(gender, birth_year) %>% 
+  summarise(missing_3050 = mean(n_family_total_income_real_3050 == 0)) %>% 
+  ggplot(aes(x = birth_year, y = missing_3050)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(missing_3050*100, 2), "%")), vjust = -1) +
+  facet_wrap(~ gender) +
+  labs(x = "Birth year",
+       y = "% no family total income obs. 30-50") +
+  scale_x_continuous(breaks = seq(1890, 2000, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(lim = c(0, 1), expand = c(0,0), labels = scales::percent)
+
+parents_sample_clean %>%
+  group_by(gender, birth_year) %>% 
+  summarise(missing_3050 = mean(n_labor_income_real_3050 == 0)) %>% 
+  ggplot(aes(x = birth_year, y = missing_3050)) +
+  geom_col() +
+  geom_text(aes(label = paste0(round(missing_3050*100, 2), "%")), vjust = -1) +
+  facet_wrap(~ gender) +
+  labs(x = "Birth year",
+       y = "% no labor income obs. 30-50") +
+  scale_x_continuous(breaks = seq(1890, 2000, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(lim = c(0, 1), expand = c(0,0), labels = scales::percent)
+
+# graph of number of parent income observations
+pct_n_inc <- parents_sample_clean %>% count(n_family_total_income_real_3050) %>% count_to_pct()
+
+parents_sample_clean %>%
+  group_by(birth_year, gender, n_family_total_income_real_3050) %>% 
+  summarise(n_obs = n()) %>% 
+  left_join(pct_n_inc) %>% 
+  mutate(n_family_inc_with_pct = paste0(n_family_total_income_real_3050, " (", round(pct*100,1), "%)")) %>% 
+  ggplot(aes(x = birth_year, y = n_obs, fill = fct_reorder(n_family_inc_with_pct, -n_family_total_income_real_3050))) +
+  geom_col(position = "fill") +
+  facet_wrap(vars(gender)) +
+  scale_fill_scico_d(palette = "lajolla", begin = .2, end = .95, direction = -1) +
+  scale_x_continuous(breaks = seq(1890, 2000, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(breaks = seq(0, 1, .2), labels = scales::percent, expand = c(0,0)) +
+  labs(x = "Birth year",
+       y = "Number of family total income observations",
+       fill = "Number of obs.",
+       title = "Number of family total income observations") +
+  guides(fill = guide_legend(ncol = 2))
+
+# labor income
+pct_n_inc <- parents_sample_clean %>% count(n_labor_income_real_3050) %>% count_to_pct()
+
+parents_sample_clean %>%
+  group_by(birth_year, gender, n_labor_income_real_3050) %>% 
+  summarise(n_obs = n()) %>% 
+  left_join(pct_n_inc) %>% 
+  mutate(n_family_inc_with_pct = paste0(n_labor_income_real_3050, " (", round(pct*100,1), "%)")) %>% 
+  ggplot(aes(x = birth_year, y = n_obs, fill = fct_reorder(n_family_inc_with_pct, -n_labor_income_real_3050))) +
+  geom_col(position = "fill") +
+  facet_wrap(vars(gender)) +
+  scale_fill_scico_d(palette = "lajolla", begin = .2, end = .95, direction = -1) +
+  scale_x_continuous(breaks = seq(1890, 2000, 5), expand = c(0.01, 0.01)) +
+  scale_y_continuous(breaks = seq(0, 1, .2), labels = scales::percent, expand = c(0,0)) +
+  labs(x = "Birth year",
+       y = "Number of labor income observations",
+       fill = "Number of obs.",
+       title = "Number of labor income observations") +
+  guides(fill = guide_legend(ncol = 2))
+```
+
+## Table descriptive stats
+
+```{r}
+inc_vars = c("labor income", "family labor income", "family tax income", "family total income")
+
+# minimum and maximum child/parent age at income observation
+child_age_min = 30
+child_age_max = 50
+parent_age_min = 30
+parent_age_max = 50
+
+# restriction for number of parent/child income observations
+n_parent_inc = 1
+n_child_inc = 1
+
+# replace zero incomes
+replace_zero_incomes = F
+
+# parents' income variables
+parents_sample_clean <- parents_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+parents_sample_clean <- parents_sample_clean %>% 
+  left_join(inc_vars %>% 
+              map(~ inc_fct(dt = parents_sample_long,
+                            inc_var = .x,
+                            age_range = parent_age_min:parent_age_max,
+                            zero_to_na = replace_zero_incomes)) %>%
+              reduce(full_join, by = "ind_id_68"))
+parents_sample_clean %>% names
+
+# children's income variables
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+child_sample_clean <- child_sample_clean %>%
+  left_join(inc_vars %>% 
+              map(~ inc_fct(dt = child_sample_long,
+                            inc_var = .x,
+                            age_range = child_age_min:child_age_max,
+                            zero_to_na = replace_zero_incomes)) %>% 
+              reduce(full_join, by = "ind_id_68"))
+child_sample_clean %>% names
+
+# generate data.frame
+stat_desc <- data.frame(variable = NA, N = NA, missing = NA, mean = NA, std = NA, p25 = NA, median = NA, p75 = NA)
+
+# parents' characteristics ----
+# income
+stat_desc[1:6,] <- parents_sample_clean |> 
+  summarise(across(c(mean_family_total_income_real_3050, n_family_total_income_real_3050, mean_age_3050_family_total_income_real, mean_labor_income_real_3050, n_labor_income_real_3050, mean_age_3050_labor_income_real),
+                   ~ list(n(),
+                          mean(is.na(.x)),
+                          # mean(!is.na(.x) & .x <= 0),
+                          mean(.x, na.rm = T),
+                          sd(.x, na.rm = T),
+                          quantile(.x, probs = .25, na.rm = T),
+                          quantile(.x, probs = .5, na.rm = T),
+                          quantile(.x, probs = .75, na.rm = T)))) |> 
+  t() |> data.frame() |> rownames_to_column()
+
+# % single parents
+pct_single <- parents_sample_clean_withchildren |> 
+  group_by(ind_id_68_child) %>%
+  summarise(n_parents = n_distinct(ind_id_68)) |> 
+  count(n_parents) |> count_to_pct()
+stat_desc[7,] <- c("% single", pct_single$pct[1]*100, rep(NA, 6))
+
+female_among_single <- parents_sample_clean_withchildren |> 
+  group_by(ind_id_68_child) %>%
+  mutate(n_parents = n_distinct(ind_id_68)) |> 
+  ungroup() |> 
+  filter(n_parents == 1) |> 
+  summarise(mean(gender == "Female"))
+stat_desc[8,] <- c("Female among single", female_among_single*100, rep(NA, 6))
+
+# mother age at child birth
+stat_desc[9,] <- parents_sample_clean_withchildren |> 
+  left_join(child_sample_clean |> select(ind_id_68_child = ind_id_68, birth_year_child = birth_year)) |> 
+  mutate(age_at_child_birth = birth_year_child - birth_year) |> 
+  filter(gender == "Female") |> 
+  summarise("mother_age_at_child_birth",
+            n_distinct(ind_id_68),
+            mean(is.na(age_at_child_birth)),
+            mean(age_at_child_birth),
+            sd(age_at_child_birth),
+            quantile(age_at_child_birth, probs = .25),
+            quantile(age_at_child_birth, probs = .5),
+            quantile(age_at_child_birth, probs = .75))
+
+# father age at child birth
+stat_desc[10,] <- parents_sample_clean_withchildren |> 
+  left_join(child_sample_clean |> select(ind_id_68_child = ind_id_68, birth_year_child = birth_year)) |> 
+  mutate(age_at_child_birth = birth_year_child - birth_year) |> 
+  filter(gender == "Male") |> 
+  summarise("father_age_at_child_birth",
+            n_distinct(ind_id_68),
+            mean(is.na(age_at_child_birth)),
+            mean(age_at_child_birth),
+            sd(age_at_child_birth),
+            quantile(age_at_child_birth, probs = .25),
+            quantile(age_at_child_birth, probs = .5),
+            quantile(age_at_child_birth, probs = .75))
+
+
+# children's characteristics
+# income
+stat_desc[11:13,] <- child_sample_clean |> 
+  summarise(across(c(mean_family_total_income_real_3050, n_family_total_income_real_3050, mean_age_3050_family_total_income_real),
+                   ~ list(n(),
+                          mean(is.na(.x)),
+                          mean(.x, na.rm = T),
+                          sd(.x, na.rm = T),
+                          quantile(.x, probs = .25, na.rm = T),
+                          quantile(.x, probs = .5, na.rm = T),
+                          quantile(.x, probs = .75, na.rm = T)))) |>
+  t() |> data.frame() |> rownames_to_column()
+stat_desc[14,] <- unlist(c(child_sample_clean |> summarise("fraction_female", mean(gender == "Female")*100), rep(NA, 6)))
+
+stat_desc_clean <- stat_desc |> 
+  mutate(across(-variable, ~ as.numeric(.x)),
+         missing = missing*100,
+         across(c(N, missing), ~ ifelse(is.na(.x), "", formatC(.x, digits = 2, format = "f", big.mark = ","))),
+         across(c(mean, std, p25, median, p75), ~ ifelse(is.na(.x), "", formatC(.x, format = "d", big.mark = ","))),
+         N = ifelse(!variable %in% c("% single", "Female among single", "fraction_female"), substr(N, 1, 5), paste0(N, "%")))
+
+rownames(stat_desc_clean) <- NULL
+stat_desc_clean[, 1] <- c("Family income (average 30-50 yrs old)",
+                          "Number of family income observations",
+                          "Mean age at family income obs.",
+                          "Labor income (average 30-50 yrs old)",
+                          "Number of labor income observations",
+                          "Mean age at labor income obs.",
+                          "Fraction single parents",
+                          "Fraction female among single parents",
+                          "Mother's age at child birth",
+                          "Father age at child birth",
+                          "Family income (average 30-50 yrs old)",
+                          "Number of family income observations",
+                          "Mean age at family income obs.",
+                          "Fraction female")
+
+kable(stat_desc_clean, format = "latex",
+      booktabs = T, caption = "Descriptive Statistics", label = "desc_stat",
+      col.names = c("", "N", "Missing (%)", "Mean", "Std. Dev.", "25th pctile", "Median", "75th pctile"),
+      align = c("l", rep("c", 7))) |> 
+  kable_styling(latex_options = c("scale_down")) |> 
+  footnote(general = "missing income observations can also correspond to values obtained by 'major assignment'.",
+           general_title = "Notes:", title_format = "italic", fixed_small_size = T, footnote_as_chunk = T, threeparttable = T) |> 
+  pack_rows("Parents", 1, 10) |> 
+  pack_rows("Children", 11, 14) |> 
+  save_kable(paste0(figure_path, "desc_stats.tex"))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```
