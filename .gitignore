@@ -1,5 +1,5 @@
 *.pdf *.sty *.bib
 *.html
-.Rproj
+.Rproj.user/
 .DS_Store
 /figures/out.
