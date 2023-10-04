@@ -1,4 +1,5 @@
-*.pdf *.sty *.bib *.html
-.Rproj.user
+*.pdf *.sty *.bib
+*.html
+.Rproj
 .DS_Store
 /figures/out.
