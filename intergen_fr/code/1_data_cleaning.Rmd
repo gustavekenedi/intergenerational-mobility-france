@@ -1,0 +1,1002 @@
+---
+title: "Data Cleaning"
+author: "Gustave Kenedi & Louis Sirugue"
+date: "04/01/2023"
+output: 
+  html_document:
+    toc: true
+    theme: cosmo
+editor_options: 
+  chunk_output_type: console
+---
+
+# Setup
+
+```{r, message = F}
+# R version 4.2.2
+# RStudio version 1.4.1717
+
+# Packages
+library(sf)         # Version 1.0.9
+library(haven)      # Version 2.5.1
+library(readxl)     # Version 1.4.1
+library(reldist)    # Version 1.7.1
+library(geosphere)  # Version 1.5.18
+library(tidyverse)  # Version 1.3.2
+library(data.table) # Version 1.14.6
+
+# Paths
+src_dir <- "C:/Users/Public/Documents/gustave_k/original_data/EDP_2017/edp_be2017_"
+prj_dir <- "C:/Users/Public/Documents/gustave_k/intergen_income_mob/jpube/revision/"
+```
+
+# Data cleaning
+
+## Birth certificates
+
+```{r}
+fullpop <- fread(paste0(src_dir, "naissance.csv"),
+                 select = c("ID_DIFF", "ENF_IND_SEXE", "ENF_IND_NAI_DATE", 
+                            "PERE_IND_NAI_DATE", "MERE_IND_NAI_DATE", "MERE_CS_CODE", 
+                            "PERE_CS_CODE", "MERE_NAT_CODE", "PERE_NAT_CODE")) %>%
+  # Recode birth year
+  .[, birth_year := as.numeric(substr(ENF_IND_NAI_DATE, 1, 4))] %>%
+  # Restrict to the cohorts of interest
+  .[birth_year %in% 1972:1981] %>%
+  # Recode variables
+  .[, ":=" (
+    # Gender
+    gender = fcase(ENF_IND_SEXE == "M", "Male", ENF_IND_SEXE == "F", "Female"),
+    # Parents year of birth
+    mother_birth_year = as.numeric(substr(MERE_IND_NAI_DATE, 1, 4)),
+    father_birth_year = as.numeric(substr(PERE_IND_NAI_DATE, 1, 4)),
+    # Parents professional category
+    mother_cs = as.numeric(substr(MERE_CS_CODE, 1, 1)),
+    father_cs = as.numeric(substr(PERE_CS_CODE, 1, 1)),
+    # Parents French nationality
+    mother_french = fcase(MERE_NAT_CODE == "1XX", 1, 
+                          !MERE_NAT_CODE %in% c("", "XXX", "1XX"), 0),
+    father_french = fcase(PERE_NAT_CODE == "1XX", 1, 
+                          !PERE_NAT_CODE %in% c("", "XXX", "1XX"), 0))] %>%
+  # Recode missing values
+  .[, ":=" (mother_birth_year = ifelse(mother_birth_year == 0, NA, mother_birth_year),
+            father_birth_year = ifelse(father_birth_year == 0, NA, father_birth_year),
+            father_cs = ifelse(father_cs %in% c(0, 9), NA, father_cs),
+            mother_cs = ifelse(mother_cs %in% c(0, 9), NA, mother_cs))] %>%
+  .[, father_birth_year := ifelse(father_birth_year == birth_year + 1, 
+                                  NA, father_birth_year)] %>%
+  # Select variables of interest
+  .[, .(ID_DIFF, gender, birth_year, mother_birth_year, father_birth_year, 
+        mother_cs, father_cs, mother_french, father_french)]
+```
+
+## EDP individuals register
+
+```{r}
+# Load individu
+individu <- fread(paste0(src_dir, "individu.csv"), 
+                  select = c("ID_DIFF", "SEXE", "NAI_DATE", "NAI_LIEU", 
+                             "DEC_DATE", "NBBI_RP1990"))
+
+# Cleaning
+individu <- individu[, .(ID_DIFF, 
+                         gender = SEXE, 
+                         birth_dep = substr(NAI_LIEU, 1, 2),
+                         birth_year = as.numeric(substr(NAI_DATE, 1, 4)), 
+                         birth_month = as.numeric(substr(NAI_DATE, 6, 7)),
+                         death_year = as.numeric(substr(DEC_DATE, 1, 4)), 
+                         nobs_RP90 = NBBI_RP1990)]
+
+# Recode Corsica
+individu[birth_dep %chin% c("2A", "2B"), birth_dep := "20"]
+# Recode Missing department
+individu[birth_dep %chin% c("00"), birth_dep := NA]
+# Department code as numeric
+individu[, birth_dep := as.numeric(birth_dep)]
+
+# Born in Metropolitan France
+individu[, born_in_france := fcase(# Unknown
+                                   is.na(birth_dep), NA,
+                                   # Metropolitan France
+                                   birth_dep %in% 1:95, T, 
+                                   # Overseas
+                                   birth_dep %in% 97:99, F)]
+```
+
+## 1990 census
+
+```{r}
+# Useful variables in the 1990 census
+rp_vars_common <- c("ID_DIFF",             # Identifier
+                    "D_90", "C_90",        # Place of residence
+                    "L2_90", "TYF_90")     # Household structure
+rp_vars_parents <- c("CS_90",              # Individual's professional category
+                     "DIP_90",             # Individual's diploma
+                     "NC_90",              # Individual' nationality
+                     "PN_90")              # Individual's place of birth
+rp_vars_child <- c("ADPF_90", "ADMF_90",   # Parents' age
+                   "CSPF_90", "CSMF_90",   # Parents' professional category
+                   "DIPPF_90", "DIPMF_90", # Parents' diploma
+                   "NPF_90", "NMF_90",     # Parents' nationality
+                   "PNPF_90", "PNMF_90")   # Parents' place of birth
+
+# Load RP 90
+rp90 <- fread(paste0(src_dir, "rp1990.csv"), 
+              select = c(rp_vars_common, rp_vars_parents, rp_vars_child)) 
+
+# Duplicates
+rp90[, .N, by = ID_DIFF][, .N, by = N]
+
+# Keep first observation for duplicates
+rp90 <- rp90[!duplicated(ID_DIFF), ]
+
+# Recode Corsica
+rp90[D_90 %chin% c("2A", "2B"), D_90 := "20"]
+
+# Reconstruct INSEE municipality code
+rp90[, depmun := fcase(C_90 < 10, paste0(D_90, "00", C_90),
+                       C_90 > 9 & C_90 < 100, paste0(D_90, "0", C_90),
+                       C_90 > 99, paste0(D_90, C_90))] %>%
+  # Numeric INSEE department code
+  .[, dep := as.numeric(D_90)] 
+
+# Recode household composition
+rp90[, type_fam := fcase(
+  TYF_90 %in% 101:113, "Father only",
+  TYF_90 %in% 201:213, "Mother only",
+  TYF_90 %in% 300:313, "Both parents (both active)",
+  TYF_90 %in% 400:413, "Both parents (father active only)",
+  TYF_90 %in% 500:503, "Both parents (mother active only)",
+  TYF_90 %in% 600:603, "Both parents (both inactive)")]
+
+# Rename parents' age variables
+rp90[, ":=" (father_age_90 = ADPF_90, mother_age_90 = ADMF_90)]
+
+# Recode professional category
+rp90[!CSPF_90 %in% c("", "$$"), father_cs2_90 := as.numeric(CSPF_90)]
+rp90[!CSMF_90 %in% c("", "$$"), mother_cs2_90 := as.numeric(CSMF_90)]
+rp90[!CS_90 %in% c("", "$$"), cs2_90 := as.numeric(CS_90)]
+
+# Recode education 
+rp90[!DIP_90 %in% c("", "$"), DIP_90 := as.numeric(DIP_90)]
+rp90[, (c("edu_90", "father_edu_90", "mother_edu_90")) := 
+       lapply(.SD, function (x) {fcase(
+         x == 1, "No diploma",
+         x == 2, "Primary education",
+         x == 3, "BEPC",
+         x == 4, "CAP",
+         x == 5, "BEP",
+         x == 6, "High school diploma",
+         x == 7, "Bachelor or technical degree",
+         x == 8, "Masters or PhD")}), 
+     .SDcols = c("DIP_90", "DIPPF_90", "DIPMF_90")]
+
+# Recode  birth nationality
+rp90[!NC_90 %in% c("", "$$"), NC_90 := as.numeric(NC_90)]
+rp90[, ":=" (father_born_french = as.numeric(NPF_90 == 11), 
+             mother_born_french = as.numeric(NMF_90 == 11), 
+             born_french = as.numeric(NC_90 == 11))]
+
+# Groups of country codes
+south_europe <- c(724, 620, 336, 674)
+
+other_europe <- c(7, 8, 20, 40, 56, 100, 196, 200, 208, 246, 278, 
+                  279, 280, 300, 616, 642, 348, 352, 372, 380, 438, 
+                  442, 470, 492, 528, 578, 752, 756, 792, 812, 826)
+
+maghreb <- c(12, 434, 478, 504, 788) 
+
+other_africa <- c(2, 24, 108, 120, 132, 140, 148, 178, 180, 204, 
+                  226, 230, 262, 266, 270, 272, 288, 450, 454, 466, 
+                  324, 384, 404, 426, 430, 508, 516, 562, 566, 624, 
+                  646, 686, 694, 706, 710, 716, 736, 740, 748, 768, 
+                  800, 818, 834, 854, 894) 
+
+# Group codes by region
+rp90[, (c("cbirth", "father_cbirth", "mother_cbirth")) := 
+       lapply(.SD, function (x) {fcase(
+         is.na(x), "France",                             
+         x %in% south_europe, "South Europe",          
+         x %in% other_europe, "Other Europe",          
+         x %in% maghreb, "Maghreb",                    
+         x %in% other_africa, "Other Africa",          
+         !(is.na(x) | x %in% 
+             c(south_europe, other_europe, maghreb, other_africa)), "Other")}), 
+     .SDcols = c("PN_90", "PNPF_90", "PNMF_90")]
+```
+
+# Children sample
+
+## Selection
+
+```{r fig_E2}
+figE2 <- individu %>%
+  # Keep individuals born in France in october 1965-1989
+  .[birth_year %in% 1965:1989 & born_in_france & birth_month == 10, ] %>%
+  # Merge RP 90 with EDP register data
+  merge.data.table(rp90[, .(ID_DIFF, L2_90)], by = "ID_DIFF", all.x = T) %>%
+  # Recode family link
+  .[, L2_90 := fcase(L2_90 %in% 1:2, "Adult of main family",
+                     L2_90 == 3, "Child of main family",
+                     L2_90 %in% 4:5, "Adult of secondary family",
+                     L2_90 == 6, "Child of secondary family",
+                     L2_90 == 7, "Not part of family",
+                     is.na(L2_90), "Not in 1990 census")] %>%
+  # Compute number of individuals by birth cohort
+  .[, tot := .N, by = birth_year] %>% 
+  # Compute share of each family link by birth cohort
+  .[, .(n = .N, pct = .N/unique(tot)), by = c("birth_year", "L2_90")] %>%
+  .[order(n), .(n, birth_year, L2_90, pct)] %>%
+  filter(n > 10)
+
+# Save underlying data
+fwrite(figE2, paste0(prj_dir, "out/fig/figE2_family_position_1990.csv"))
+
+# Generate the stacked barplot
+ggplot(figE2, aes(x = birth_year, y = pct, fill = L2_90)) + 
+  geom_bar(stat = "identity", position = "stack")
+
+ggsave(paste0(prj_dir, "out/fig/figE2_family_position_1990.png"))
+```
+
+```{r}
+children <- individu %>%
+  # Keep individuals born in France in October 1972-1981 and alive in 2018
+  .[birth_year %in% 1972:1981 & birth_month == 10 & 
+      is.na(death_year) & born_in_france, ] %>%
+  # Merge RP 90 with EDP register data
+  merge.data.table(rp90, by = "ID_DIFF", all.x = T) %>%
+  # Keep useful variables
+  .[, .(ID_DIFF, gender, birth_dep, birth_year, born_in_france, dep, depmun, 
+        nobs_RP90, family_link = L2_90, type_fam, father_age_90, mother_age_90, 
+        father_cs2_90, mother_cs2_90, father_edu_90, mother_edu_90, 
+        father_born_french, mother_born_french, mother_cbirth, father_cbirth)]
+```
+
+## Add child All Employee Panel data
+
+```{r}
+# Load necessary variables
+panact <- fread(paste0(src_dir, "panact.csv"), 
+                select = c("ID_DIFF", "AN", "NETNETR")) %>%
+  # Recode identifier
+  .[, ID_DIFF := as.character(ID_DIFF)] %>%
+  .[, ID_DIFF := fcase(nchar(ID_DIFF) == 4, paste0("000000", ID_DIFF),
+                       nchar(ID_DIFF) == 5, paste0("00000", ID_DIFF),
+                       nchar(ID_DIFF) == 6, paste0("0000", ID_DIFF),
+                       nchar(ID_DIFF) == 7, paste0("000", ID_DIFF))] 
+
+# Add panact information to full population birth-certificate data
+fullpop <- fullpop %>%
+  merge.data.table(
+    # Merge AEP data to year of birth
+    merge.data.table(fullpop[, .(ID_DIFF, birth_year)], 
+                     panact, all.x = T, all.y = F, by = "ID_DIFF") %>%
+      # Restrict to observations within age 35-45
+      .[(AN - birth_year) %in% 35:45] %>%
+      # Compute the number of observations and average income
+      .[, .(n_dads = .N, avg_inc = mean(NETNETR)), by = ID_DIFF],
+    all.x = T, all.y = F, by = "ID_DIFF") %>%
+  # Replace missing number of observations by 0 obs
+  .[is.na(n_dads), n_dads := 0]
+
+panact_child <- panact %>%
+  # Keep individuals in our sample
+  merge.data.table(children[, .(ID_DIFF, birth_year)], 
+                   all.x = F, all.y = T, by = "ID_DIFF") %>%
+  # Generate age variable
+  .[, age := AN - birth_year]
+
+# Labor income from age 20 to 43
+panact_20_43 <- panact_child %>%
+  # Keep income observed at 20-43, with age and identifier
+  .[age %in% 20:43, .(ID_DIFF, age = paste0("netinc_age_", age), NETNETR)] %>%
+  # Reshape to wide (1 column for income at a given age)
+  dcast(ID_DIFF ~ age, value.var = "NETNETR") 
+
+# Number of labor income observations from 25 to 43
+panact_n_25_43 <- panact_child %>%
+  .[age %in% 25:43, .(n_netinc_25_43 = .N), by = ID_DIFF]
+
+panact_child <- panact_child %>%
+  # Keep years overlapping with available tax data and selected children
+  .[AN %in% 2010:2015 & age %in% 35:45, ] %>%
+  # Compute average income and number of income observations
+  .[, .(avg_netinc_2010_15_3545 = mean(NETNETR), 
+        n_netinc_3545 = .N), by = ID_DIFF]
+
+children <- children %>%
+  # Put results in children dataset 
+  merge.data.table(panact_20_43, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(panact_n_25_43, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(panact_child, all.x = T, by = "ID_DIFF") %>%
+  # Document 0 number of income observation if missing
+  .[is.na(n_netinc_3545), n_netinc_3545 := 0]
+
+# Remove unnecessary objects
+rm(panact_child, panact_20_43, panact_n_25_43)
+```
+
+## Add tax data 
+
+```{r}
+# Clean fiscal data
+fisc_indiv_long <- lapply(2011:2017, function (year) {
+  
+  # Load individual main tax form
+  fread(paste0(src_dir, "fisc_individu_", year, ".csv"),
+        select = c("ID_DIFF", "AN_FISC", "CSDEP", "ID_FISC_FOY_DIFF", 
+                   "ID_FISC_LOG_DIFF", "TYPE_FISC", "TYPE_PRES")) %>%
+    
+    # Recode identifier
+    .[, ID_DIFF := as.character(ID_DIFF)] %>%
+    .[, ID_DIFF := fcase(nchar(ID_DIFF) == 4, paste0("000000", ID_DIFF),
+                         nchar(ID_DIFF) == 5, paste0("00000", ID_DIFF),
+                         nchar(ID_DIFF) == 6, paste0("0000", ID_DIFF),
+                         nchar(ID_DIFF) == 7, paste0("000", ID_DIFF))] %>%
+    
+    # Keep main declaration of heads and spouses from our children sample
+    .[#ID_DIFF %chin% children$ID_DIFF & 
+        TYPE_PRES == 1 & TYPE_FISC %in% c("1", "2", "01", "02"), ] %>%
+    .[, TYPE_FISC := as.numeric(TYPE_FISC)] %>%
+    
+    # Merge with household income data
+    merge.data.table(fread(paste0(src_dir, "fisc_revenu_", year, ".csv"),
+                           select = c("ID_FISC_LOG_DIFF", "TYPMEN9", "REVDECM",
+                                      "PRODUITFIN", "ZSALM")),
+                     all.x = T, by = "ID_FISC_LOG_DIFF") %>%
+    
+    # Merge with individual income data
+    merge.data.table(fread(paste0(src_dir, "fisc_revdet_", year, ".csv"),
+                           select = c("ID_FISC_FOY_DIFF", "TYPE_FISC",  
+                                      "YSALI", "YCHOI", "YRSTI", "YALRI", 
+                                      "YRAGI", "YBICI", "YBNCI")) %>%
+                       
+                       # Filter only household heads and their spouse
+                       .[TYPE_FISC %in% c("1", "2", "01", "02"), ] %>%
+                       .[, TYPE_FISC := as.numeric(TYPE_FISC)] %>%
+                       
+                       # Keep one observation per ID_FISC_FOY_DIFF / TYPE_FISC
+                       distinct(ID_FISC_FOY_DIFF, TYPE_FISC, .keep_all = TRUE), 
+                     all.x = T, by = c("ID_FISC_FOY_DIFF", "TYPE_FISC"))
+  
+}) %>% rbindlist()
+
+# Clean household structure information
+fisc_hh <- fisc_indiv_long %>%
+  # Keep individuals of interest
+  .[ID_DIFF %chin% children$ID_DIFF] %>%
+  # Add birth_year variable
+  merge.data.table(children[, .(ID_DIFF, birth_year)], all.x = T, by = "ID_DIFF") %>%
+  # Generate age variable
+  .[, age := AN_FISC - birth_year - 1] %>%
+  # Keep information observed from age 35 to 45
+  .[age %in% 35:45] %>%
+  # Select variables of interest
+  .[, .(ID_FISC_LOG_DIFF, AN_FISC, TYPMEN9)] %>%
+  # Do not multiply household information by number of household members
+  distinct() %>%
+  # Recode household structure
+  .[, `Household structure` := fcase(is.na(TYPMEN9), "Missing",
+                                     TYPMEN9 %in% 11:12, "Single",
+                                     TYPMEN9 %in% 21:22, "Single parent",
+                                     TYPMEN9 == 30, "Couple",
+                                     TYPMEN9 %in% 41:43, "Couple with children",
+                                     TYPMEN9 == 50, "Complex household")] 
+
+# Household structure distribution
+fisc_hh <- fisc_hh[, n_year := .N, by = AN_FISC] %>%
+  .[, .(value = round(100 * (.N / unique(n_year)), 1)), 
+    by = c("AN_FISC", "Household structure")] %>%
+  dcast(`Household structure` ~ AN_FISC) %>%
+  merge.data.table(fisc_hh[, .(Overall = round(100 * (.N / nrow(fisc_hh)), 1)), 
+                           by = "Household structure"], 
+                   by = "Household structure") %>% 
+  .[order(-`2011`)]
+
+fisc_hh
+# Save descriptive statistics
+fwrite(fisc_hh, paste0(prj_dir, "out/tab/fisc_hh_structure_distrib.csv"))
+
+# Adjust nominal income variables to real 2015 euros
+# Price level data is from the INSEE website (ref: 001764363)
+# insee.fr/fr/statistiques/serie/001764363
+fisc_indiv_long <- fisc_indiv_long %>%
+  merge.data.table(
+    data.table(price_level = c(0.9471, 0.9671, 0.9860, 0.9946, 0.9996, 1, 1.0018),
+               AN_FISC = 2011:2017), all.x = T, by = "AN_FISC") %>%
+  # Recode department of residence in adulthood
+  .[CSDEP %in% c("2A", "2B"), CSDEP := 20] %>%
+  .[CSDEP == "B3", CSDEP := 98] %>%
+  .[, CSDEP := as.numeric(CSDEP)]
+
+# Adulthood department
+adult_dep <- fisc_indiv_long %>%
+  # Keep individuals and variables of interest
+  .[ID_DIFF %chin% children$ID_DIFF, .(ID_DIFF, AN_FISC, CSDEP)] %>%
+  # Number of tax files of the individual in each department
+  .[, ndep := .N, by = c("ID_DIFF", "CSDEP")] %>%
+  # Maximum number of times the individual is observed in a same department
+  .[, maxndep := max(ndep), by = "ID_DIFF"] %>%
+  # Keep most frequent department
+  .[ndep == maxndep] %>% 
+  # Most recent year by department
+  .[, maxyear := max(AN_FISC), by = c("ID_DIFF", "ndep")] %>%
+  # In case of ties keep the most recent
+  .[AN_FISC == maxyear] %>%
+  .[, .(ID_DIFF, adult_dep = CSDEP)]
+
+# Variables to normalize
+tonorm <- c("YSALI", "ytot", "revtotnonpsocm", "revsalm")
+
+fisc_indiv_long <- fisc_indiv_long[, ":=" (
+  # Compute number of adults
+  household_n = fcase(TYPMEN9 %in% c(11, 12, 21, 22), 1,
+                      TYPMEN9 %in% c(30, 41, 42, 43, 50), 2),
+  # Create income variables
+  ytot = YALRI + YBICI + YBNCI + YCHOI + YRAGI + YRSTI + YSALI,
+  revtotnonpsocm = REVDECM + PRODUITFIN,
+  revsalm = ZSALM)] %>%
+  # Divide by price index
+  .[, (paste0(tolower(tonorm), "_real")) := 
+      lapply(.SD, function (x) {x/price_level}), 
+    .SDcols = tonorm] %>%
+  # Divide rev* variables by number of adults
+  .[, (paste0(grep("^rev", tolower(tonorm), value = T), "_real_n")) := 
+      lapply(.SD, function (x) {x/household_n}), 
+    .SDcols = paste0(grep("^rev", tolower(tonorm), value = T), "_real")] %>%
+  # Add birth_year variable
+  merge.data.table(children[, .(ID_DIFF, birth_year)], 
+                   all.x = T, by = "ID_DIFF") %>%
+  # Generate age variable
+  .[, age := AN_FISC - birth_year - 1]
+
+# Compute average income over ages 35-45
+avg_3545 <- fisc_indiv_long[age %in% 35:45, ] %>%
+  .[, lapply(.SD, function (x) {mean(x, na.rm = T)}), by = ID_DIFF,
+    .SDcols = grep("_real", names(fisc_indiv_long), value = T)]
+
+# Rename conveniently
+names(avg_3545) <- paste0("avg_", names(avg_3545), "_2010_16_3545")
+names(avg_3545)[1] <- "ID_DIFF"
+
+# Add to full population sample
+fullpop <- fullpop %>%
+  # Add average income over ages 35-45
+  merge.data.table(avg_3545[, .(ID_DIFF, fisc_income = avg_revtotnonpsocm_real_2010_16_3545,
+                                fisc_income_n = avg_revtotnonpsocm_real_n_2010_16_3545)],
+                   all.x = T, all.y = F, by = "ID_DIFF") %>%
+  # Add number of fiscal observations
+  merge.data.table(fisc_indiv_long[age %in% 35:45, ][, .(n_fisc = .N), by = ID_DIFF],
+                   all.x = T, all.y = F, by = "ID_DIFF")%>%
+  # Replace missing number of observations by 0 obs
+  .[is.na(n_fisc), n_fisc := 0]
+
+# Save full population data
+fwrite(fullpop, paste0(prj_dir, "data/fullpop.csv"))
+
+# Keep only sample children in fiscal data
+fisc_indiv_long <- fisc_indiv_long[ID_DIFF %chin% children$ID_DIFF]
+avg_3545 <- avg_3545[ID_DIFF %chin% children$ID_DIFF]
+
+# Compute average income regardless of age
+avg_full <- fisc_indiv_long %>%
+  .[, lapply(.SD, function (x) {mean(x, na.rm = T)}), by = ID_DIFF,
+    .SDcols = grep("_real", names(fisc_indiv_long), value = T)]
+
+# Rename conveniently
+names(avg_full) <- paste0("avg_", names(avg_full), "_2010_16")
+names(avg_full)[1] <- "ID_DIFF"
+
+# Number of household income observations
+n_3545 <- fisc_indiv_long %>% 
+  .[age %in% 35:45] %>%
+  .[, .(n_revtotnonpsocm_real_3545 = sum(!is.na(revtotnonpsocm_real)),
+        pct_couple = mean(household_n - 1, na.rm = T)), by = "ID_DIFF"]
+
+# Household income at each age in 29-44
+inc_29_44 <- fisc_indiv_long %>%
+  # Keep income observed at 20-43, with age and identifier
+  .[age %in% 29:44, .(ID_DIFF, revtotnonpsocm_real, 
+                      age = paste0("revtotnonpsocm_real_age_", age))] %>%
+  # Reshape to wide (1 column for income at a given age)
+  dcast(ID_DIFF ~ age, value.var = "revtotnonpsocm_real") 
+
+# Household income for 1 to 7 inc observations centered in 2013 (so 2014 file)
+years <- list(2014)
+for (i in 1:3) {
+  years[[2 * i]] <- ((2014-i):(2014+i))[-(i + 1)]
+  years[[(2 * i) + 1]] <- (2014-i):(2014+i)
+}
+
+# Compute average income for each set of ages
+income_centered <- Reduce(
+  function(x, y) {
+    merge.data.table(x, y, all.x = T, all.y = T, by = "ID_DIFF")
+  },
+  lapply(years, function(x) {
+    fisc_indiv_long %>%
+      .[!is.na(revtotnonpsocm_real) & age %in% 35:45] %>%
+      .[, N := .N, by = ID_DIFF] %>% 
+      .[N == 7 & AN_FISC %in% x, .(avg = mean(revtotnonpsocm_real, na.rm = T)), by = "ID_DIFF"] %>% 
+      setnames(old = "avg", new = paste0("avg_revtotnonpsocm_real_centered_", length(x))) 
+  })
+)
+
+# Add to children dataset
+children <- children %>%
+  merge.data.table(avg_full, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(avg_3545, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(n_3545, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(inc_29_44, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(income_centered, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(adult_dep, all.x = T, by = "ID_DIFF")
+
+# Remove unnecessary objects
+rm(fisc_indiv_long, years, tonorm, avg_full, avg_3545, n_3545, inc_29_44, 
+   income_centered, adult_dep, fisc_hh, fullpop)
+```
+
+## Add EAR data
+
+```{r}
+college <- lapply(2004:2017, function(x) {
+  # Import diploma from annual census surveys
+  fread(paste0(src_dir, "ear", x, "_individu.csv"), 
+        select = c("ID_DIFF", "DIPL"), colClasses = "character") %>%
+    # Keep EDP individuals and generate year
+    .[ID_DIFF != "", ] %>% .[, year := x]
+}) %>% rbindlist() %>%
+  # Latest diploma obtain is from college
+  .[, college := ifelse(year <= 2014, as.numeric(DIPL > 16), as.numeric(DIPL > 15))] %>%
+  # Whether or not the individual went to college
+  .[DIPL != "ZZ", .(college = max(college)), by = ID_DIFF]
+
+# Add to children dataset
+children <- children %>%
+  merge.data.table(college, all.x = T, by = "ID_DIFF")
+
+# Remove unnecessary objects
+rm(college)
+```
+
+# Synthetic parents
+
+## Sample selection
+
+```{r}
+syn_parents <- individu[, .(ID_DIFF, gender, birth_year, nobs_RP90)] %>%
+  # Merge offspring data to individu
+  merge.data.table(
+    fread(paste0(src_dir, "descendance.csv"),
+          select = c("ID_DIFF", "ENF_IND_NAI_DATE", "ENF_IND_NAI_LIEU_DEPCOM")) %>%
+      # Generate child birth year and department
+      .[, ":=" (child_birth_year = as.numeric(substr(ENF_IND_NAI_DATE, 1, 4)),
+                child_birth_dep = substr(ENF_IND_NAI_LIEU_DEPCOM, 1, 2))] %>%
+      # Recode birth department
+      .[child_birth_dep %in% c("2A","2B"), child_birth_dep := "20"] %>%
+      # Convert to numeric
+      .[, child_birth_dep := as.numeric(child_birth_dep)] %>%
+      # Select useful variables
+      .[, .(ID_DIFF, child_birth_year, child_birth_dep)],
+    all.x = T, by = "ID_DIFF") %>%
+  # Keep if child born in 1972-1981 in metropolitan France
+  .[child_birth_year %in% 1972:1981 & child_birth_dep %in% 1:95, ] %>%
+  # Remove unnecessary variables and generate age in 1990
+  .[, ":=" (child_birth_year = NULL, 
+            child_birth_dep = NULL, 
+            age_90 = 1990 - birth_year)]
+
+# Add census information to synthetic parents sample
+syn_parents <- syn_parents %>% 
+  # Add 1990 census variables
+  merge.data.table(rp90[, .(ID_DIFF, dep, depmun, type_fam, cbirth, born_french, 
+                            edu_90, cs2_90)], all.x = T, by = "ID_DIFF")
+```
+
+## Add All Employee Panel data
+
+```{r}
+# All Employee data on synthetic parents sample
+panact_syn_parents <- panact[ID_DIFF %chin% syn_parents$ID_DIFF, ] %>%
+  # Add birth year information
+  merge.data.table(individu[, .(ID_DIFF, birth_year)], 
+                   all.x = T, by = "ID_DIFF") %>%
+  # Compute age
+  .[, age := AN - birth_year]
+
+# Wage at each age in 25-60
+wage_25_60 <- panact_syn_parents %>%
+  # Keep income observed at 25-60, with age and identifier
+  .[age %in% 25:60, .(ID_DIFF, NETNETR, age = paste0("netinc_", age))] %>%
+  # Reshape to wide (1 column for income at a given age)
+  dcast(ID_DIFF ~ age, value.var = "NETNETR") 
+
+# Average income and number of obs between ages 35-45
+wage_35_45 <- panact_syn_parents[age %in% 35:45, ] %>%
+  .[, .(avg_netinc_3545 = mean(NETNETR),
+        n_netinc_3545 = .N), by = "ID_DIFF"]
+
+# Average income and number of obs between ages 35-45
+wage_35_45_post_88 <- panact_syn_parents[age %in% 35:45 & AN >= 1988, ] %>%
+  .[, .(avg_netinc_3545_post_88 = mean(NETNETR),
+        n_netinc_3545_post_88 = .N), by = "ID_DIFF"]
+
+# List of ages from 1 to 11 observations around 40
+ages <- list(40)
+for (i in 1:5) {
+  ages[[2 * i]] <- ((40-i):(40+i))[-(i + 1)]
+  ages[[(2 * i) + 1]] <- (40-i):(40+i)
+}
+
+# Compute average wage for each set of ages
+wage_centered <- Reduce(
+  function(x, y) {
+    merge.data.table(x, y, all.x = T, all.y = T, by = "ID_DIFF")
+  },
+  lapply(ages, function(x) {
+    panact_syn_parents %>% 
+      .[age %in% x, .(avg = mean(NETNETR, na.rm = T), .N), by = "ID_DIFF"] %>% 
+      .[N == length(x), ] %>% .[, N := NULL] %>%
+      setnames(old = "avg", new = paste0("avg_netinc_40_", length(x))) 
+  })
+)
+
+syn_parents <- syn_parents %>%
+  # Add everything to the dataset
+  merge.data.table(wage_25_60, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(wage_35_45, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(wage_35_45_post_88, all.x = T, by = "ID_DIFF") %>%
+  merge.data.table(wage_centered, all.x = T, by = "ID_DIFF") %>%
+  # Set number of observations to 0 is missing labor income
+  .[is.na(n_netinc_3545), n_netinc_3545 := 0] %>%
+  .[is.na(n_netinc_3545_post_88), n_netinc_3545_post_88 := 0]
+
+# Remove unnecessary objects
+rm(panact_syn_parents, panact, individu, rp90, wage_25_60, wage_35_45, 
+   wage_35_45_post_88, ages, wage_centered)
+```
+
+# Geographic variables
+
+## Shapefile
+
+```{r}
+read_sf(paste0("//casd/casdfs/LibreAcces/Base de données ADMIN-EXPRESS - IGN/",
+               "ADMIN-EXPRESS_2-0__SHP__FRA_2019-01-18/ADMIN-EXPRESS/", 
+               "1_DONNEES_LIVRAISON_2019-01-18/ADE_2-0_SHP_LAMB93_FR/", 
+               "DEPARTEMENT.shp")) %>%
+  mutate(dep = as.numeric(ifelse(INSEE_DEP %in% c("2A", "2B"), 20, INSEE_DEP)),
+         dep_lab = ifelse(INSEE_DEP %in% c("2A", "2B"), "CORSE", NOM_DEP)) %>%
+  group_by(dep, dep_lab) %>%
+  summarise(geometry = st_union(geometry)) %>% 
+  write_sf(paste0(prj_dir, "data/dep.shp"))
+```
+
+## From All Employee Panel
+
+```{r}
+# Import necessary variables
+dads <- read_dta("C:/Users/Public/Documents/gustave_k/original_data/DADS_90/dads96.dta", 
+                 col_select = c("d_partement_de_r_sidence", 
+                                "salaire_net_fiscal_en_euros_cons")) %>%
+  # Convert to datatable
+  as.data.table() %>%
+  # Rename variables
+  .[, .(dep = d_partement_de_r_sidence, 
+        wage = salaire_net_fiscal_en_euros_cons)] %>%
+  # Remove overseas and foreign
+  .[!dep %chin% c("9A", "9B", "9C", "9D", 97:99), ] %>%
+  # Recode Corsica
+  .[dep %in% c("2A", "2B"), dep := 20, ] %>%
+  # Sort by increase wage order within departments
+  .[order(wage), .SD, by = "dep"] %>%
+  # Compute percentile ranks within departments
+  .[, ":=" (rank = ceiling(100 * seq(1, .N, 1) / .N)), by = "dep"] %>% 
+  # Wage of top 1 percent
+  .[rank == 100, top1wage := wage] %>%
+  # Compute department characteristics
+  .[, .(lmean_wage_dep = log(mean(wage)),
+        gini_dep = gini(wage),
+        theil_dep = sum(log(mean(wage) / wage)) / .N,
+        sharetop1_dep = sum(top1wage, na.rm = T) / sum(wage)), by = "dep"]
+```
+
+## From Census
+
+### From main dataset
+
+```{r}
+# The census is stored in separate files for each department
+census_main_filepath <- "C:/Users/Public/Documents/gustave_k/original_data/RP_1990/principale/GEN_A1000904_DCODID"
+
+# For each of them
+census_main <- lapply(dads$dep, function(x) {
+  
+  # Open department-specific census file
+  if (x == "20") {
+    dep_census <- rbind(fread(paste0(census_main_filepath, "2A", ".csv"), 
+                              select = c("C", "AGER", "TACT", "INAT")),
+                        fread(paste0(census_main_filepath, "2B", ".csv"), 
+                              select = c("C", "AGER", "TACT", "INAT")))
+  } else {
+    dep_census <- fread(paste0(census_main_filepath, x, ".csv"), 
+                        select = c("C", "AGER", "TACT", "INAT"))  
+  }
+  
+  # On adult individuals in the census
+  dep_census[AGER > 17, ] %>%
+    # Recode municipality identifiers
+    .[, C := as.character(C)] %>%
+    .[, mun := fcase(nchar(C) == 1, paste0("00", C),
+                     nchar(C) == 2, paste0("0", C),
+                     nchar(C) == 3, C)] %>%
+    .[, depmun := paste0(x, mun)] %>%
+    .[depmun %chin% as.character(13201:13216), depmun := "13055"] %>%
+    .[depmun %chin% as.character(69381:69389), depmun := "69123"] %>%
+    # Compute department-level characteristics
+    .[, ":=" (unemp_dep = mean(TACT == 12), 
+              foreign_dep = mean(INAT == 21))] %>%
+    # Compute municipality-level characteristics
+    .[, .(dep = x,
+          unemp_dep = unique(unemp_dep), 
+          foreign_dep = unique(foreign_dep),
+          unemp_mun = mean(TACT == 12), 
+          foreign_mun = mean(INAT == 21)), by = "depmun"]
+
+# Bind all census statistics on top of the others
+}) %>% rbindlist()
+```
+
+### From complementary dataset
+
+```{r}
+# Complementary census files are stored at the department level for the largest
+# departments and at the region level otherwise
+comp_files <- c(paste0("D", c(75, 77:78, 91:95)), 
+                paste0("R", c(21:26, 31, 41:43, 52:54, 
+                              72:74, 82:83, 91, 93:94)))
+
+census_comp_filepath <- "C:/Users/Public/Documents/gustave_k/original_data/RP_1990/complementaire/GEN_A1000902_DNCOD"
+
+census_comp <- lapply(comp_files, function (x) {
+  
+  # Open census file
+  fread(paste0(census_comp_filepath, x, ".csv"), 
+        select = c("D", "C", "AGER", "TYPMC", "DIPL"))[AGER > 17, ] %>%
+    # Recode department and municipality
+    .[, ":=" (dep = ifelse(D %in% c("2A", "2B"), "20", D), 
+              C = as.character(C))] %>%
+    .[, ":=" (mun = fcase(nchar(C) == 1, paste0("00", C),
+                          nchar(C) == 2, paste0("0", C),
+                          nchar(C) == 3, C),
+              dep = ifelse(nchar(dep) == 1, paste0("0", dep), dep))] %>%
+    .[, depmun := paste0(dep, mun)] %>%
+    .[depmun %chin% as.character(13201:13216), depmun := "13055"] %>%
+    .[depmun %chin% as.character(69381:69389), depmun := "69123"] %>%
+    # Compute department characteristics
+    .[, ":=" (single_dep = mean(TYPMC == 3, na.rm = T), 
+              highschool_dep = mean(DIPL >= 6)), by = "dep"] %>%
+    # Compute municipality characteristics
+    .[, .(dep = unique(dep),
+          single_dep = unique(single_dep),
+          highschool_dep = unique(highschool_dep),
+          single_mun = mean(TYPMC == 3, na.rm = T)), by = "depmun"]
+
+# Bind all census statistics on top of the others
+}) %>% rbindlist()
+```
+
+## From external sources
+
+### BDCOM
+
+Source: http://www.progedo-adisp.fr/enquetes/XML/lil.php?lil=lil-0363
+
+```{r}
+bdcom <- fread(paste0("C:/Users/Public/Documents/gustave_k/", 
+                      "intergen_income_mob/src/data_dep/bdcom90.csv"), 
+               select = c("D", "DEPCOM2", "NRES90", "SU")) %>%
+  # Recode Corsica
+  .[, dep := ifelse(D %in% c("2A", "2B"), "20", as.character(D))] %>%
+  # Keep metropolitan departments
+  .[as.numeric(dep) <= 95, ] %>%
+  # Municipality-level characteristics
+  .[, ":=" (density_mun= log(NRES90/SU), 
+            pop_mun = log(NRES90),
+            depmun = paste0(dep, substr(as.character(DEPCOM2), 3, 5)))] %>%
+  # Department-level density
+  .[, density_dep := log(sum(NRES90)/sum(SU)), by = dep] %>%
+  # Keep useful variables
+  .[, .(depmun, pop_mun, density_mun, dep, density_dep)]
+```
+
+### BPE & Ministère de la culture
+
+BPE: http://www.progedo-adisp.fr/enquetes/XML/lil.php?lil=lil-0423  
+
+Min. culture: https://data.culture.gouv.fr/explore/dataset/liste-et-localisation-des-musees-de-france/export/
+
+Shapefile : https://ec.europa.eu/eurostat/web/gisco/geodata/reference-data/administrative-units-statistical-units/communes
+
+```{r}
+# Cinemas and higher education
+bpe <- fread(paste0("C:/Users/Public/Documents/gustave_k/intergen_income_mob/", 
+                    "src/data_dep/lil-0423.csv/Csv/bpe07_ensemble.csv"), 
+             sep = ";", select = c("DEP", "TYPEQU")) %>% 
+  # Recode Corsica
+  .[, dep := ifelse(DEP %in% c("2A", "2B"), "20", as.character(DEP))] %>%
+  # Keep metropolitan France
+  .[nchar(dep) == 2, ] %>%
+  # Number of cinemas and higher education institutions
+  .[, .(cinemas_dep = sum(TYPEQU == "F301"),
+        higher_edu_dep = log(sum(grepl("^C4|^C5", TYPEQU)))), by = "dep"]
+
+# Museums
+minc <- fread(paste0("C:/Users/Public/Documents/gustave_k/intergen_income_mob/",
+                     "src/data_dep/musees-de-france.csv"), 
+              sep = ";", select = "CP") %>%
+  # Recode municipality code
+  .[, CP := as.character(CP)] %>% 
+  .[nchar(CP) == 4, CP := paste0("0", CP)] %>%
+  # Get department code
+  .[, dep := substr(CP, 1, 2)] %>%
+  # Keep metropolitan departments
+  .[as.numeric(dep) < 96, ] %>%
+  # Compute number of museums
+  .[, .(museums_dep = .N), by = "dep"]
+
+# Distance to higher education
+municipalities <- st_read(paste0("C:/Users/Public/Documents/gustave_k/",
+                                 "intergen_income_mob/src/import_shp/", 
+                                 "ref-communes-2010-01m.shp/COMM_LB_2010_4326.shp")) %>% 
+  filter(CNTR_CODE == "FR") %>%
+  mutate(dep = substr(COMM_ID, 5, 6),
+         com = substr(COMM_ID, 10, 12),
+         depcom = paste0(dep, com),
+         CODGEO = ifelse(dep == "75", "75056", depcom)) %>%
+  filter(dep %in% c(paste0("0", 1:9), 10:19, "2A", "2B", 21:95)) %>%
+  filter(!depcom %in% paste0("75", 102:120)) %>%
+  mutate(depcom = ifelse(depcom == "75101", "75056", as.character(depcom)))
+
+# Public higher education location
+mun_public_edu <- read.csv(paste0("C:/Users/Public/Documents/gustave_k/",
+                                  "intergen_income_mob/src/data_dep/lil-0423.csv/",
+                                  "Csv/bpe07_enseignement.csv"), sep = ";") %>%
+  filter(nchar(as.character(DEP)) == 2) %>%
+  mutate(depcom = DEPCOM,
+         depcom = ifelse(depcom %in% paste0("75", 101:120), "75056", as.character(depcom)),
+         depcom = ifelse(depcom %in% paste0("13", 201:216), "13055", as.character(depcom)),
+         depcom = ifelse(depcom %in% paste0("69", 381:389), "69123", as.character(depcom)),
+         depcom = ifelse(depcom == "81107", "81132", as.character(depcom))) %>% 
+  full_join(municipalities) %>%
+  filter(TYPEQU %in% c("C501", "C502")) %>%
+  mutate(school_LON = LON, school_LAT = LAT) %>%
+  select(depcom, school_LON, school_LAT) %>% 
+  unique()
+
+# Compute distances
+min_dist_edu <- tibble(school_LAT = rep(mun_public_edu$school_LAT, nrow(municipalities)),
+                       school_LON = rep(mun_public_edu$school_LON, nrow(municipalities)),
+                       LAT = rep(municipalities$LAT, each = nrow(mun_public_edu)),
+                       LON = rep(municipalities$LON, each = nrow(mun_public_edu)),
+                       depcom = rep(municipalities$depcom, each = nrow(mun_public_edu))) %>%
+  mutate(dist_edu = distGeo(tibble(LON, LAT), tibble(school_LON, school_LAT)) / 1000) %>%
+  group_by(depcom) %>%
+  summarise(min_dist_edu = min(dist_edu)) %>%
+  inner_join(read_excel(paste0("C:/Users/Public/Documents/gustave_k/",
+                               "intergen_income_mob/src/import_shp/",
+                               "table-appartenance-geo-communes-10/",
+                               "table-appartenance-geo-communes-10.xls"), 
+                        skip = 5) %>% select(depcom = CODGEO, POP_MUN_2008)) %>%
+  mutate(dep = substr(depcom, 1, 2), 
+         dep = ifelse(dep %in% c("2A", "2B"), "20", dep)) %>%
+  as.data.table() %>%
+  .[, .(dist_edu_dep = sum((min_dist_edu * POP_MUN_2008) / sum(POP_MUN_2008))), by = "dep"]
+```
+
+### Ministère de l'intérieur
+
+Crimes 1996: https://www.data.gouv.fr/en/datasets/chiffres-departementaux-mensuels-relatifs-aux-crimes-et-delits-enregistres-par-les-services-de-police-et-de-gendarmerie-depuis-janvier-1996/  
+
+Vote 1995: https://www.data.gouv.fr/fr/datasets/elections-presidentielles-1965-2012-1/
+
+```{r}
+# For each department
+crime <- lapply(c(paste0("0", 1:9), 10:19, "2A", "2B", 21:95), function (x) {
+  
+  # Create a table with the department indicator
+  data.table(dep = x,
+             # And the number of crimes from the corresponding sheet
+             nb_crime = read_excel(paste0("C:/Users/Public/Documents/gustave_k/", 
+                                          "intergen_income_mob/src/data_dep/", 
+                                          "tableaux-4001-ts.xlsx"), x) %>%
+               # Take each month in 1996
+               select(paste0("_1996_", c(paste0("0", 1:9), 10:12))) %>%
+               # Sum over all crime types and all months
+               summarise(across(everything(), sum)) %>% t() %>% sum())
+
+  # Put every department on top of each other
+}) %>% rbindlist() %>%
+  # Recode Corsica
+  .[dep %in% c("2A", "2B"), dep := "20"] %>%
+  # Sum for Corsica
+  .[, .(nb_crime_dep = sum(nb_crime)), by = "dep"]
+
+# Vote
+vote <- read.csv(paste0("C:/Users/Public/Documents/gustave_k/intergen_income_mob/",
+                        "src/data_dep/cdsp_presi1995t1_circ.csv")) %>%
+  as.data.table() %>%
+  .[, .(dep = Code.dÃ.partement, Votants, Inscrits)] %>%
+  .[dep %in% c("2A", "2B"), dep := 20] %>%
+  .[nchar(dep) == 1, dep := paste0("0", dep)] %>%
+  .[, .(participation_dep = 100*(sum(Votants)/sum(Inscrits))), by = dep]
+```
+
+## Merge and save
+
+```{r}
+# Municipality-level variables
+mun <- census_main[, .(depmun, unemp_mun, foreign_mun)] %>%
+  # Merge main census variables with complementary census variables
+  merge.data.table(census_comp[, .(depmun, single_mun)], 
+                   all.x = T, all.y = T, by = "depmun") %>%
+  # Merge with population and population density
+  merge.data.table(bdcom[, .(depmun, pop_mun, density_mun)],
+                   all.x = T, all.y = T, by = "depmun")
+
+# Department-level variables
+dep <- read_excel(paste0("C:/Users/Public/Documents/gustave_k/",
+                         "intergen_income_mob/src/data_dep/", 
+                         "fichier_poplegale_6818.xlsx"), 
+                  "1990", skip = 7, col_names = T) %>% 
+  # 1990 INSEE population to normalize crime and amenity
+  as.data.table() %>%
+  # Generate department code 
+  .[, dep := substr(COM, 1, 2)] %>%
+  # Recode Corsica
+  .[dep %in% c("2A", "2B"), dep := "20"] %>% 
+  # Keep metropolitan France
+  .[as.numeric(dep) < 96, ] %>%
+  # Compute department population
+  .[, .(pop_dep = sum(PSDC90)), by = "dep"] %>%
+  # Merge all department-level variables
+  merge.data.table(distinct(census_main[, .(dep, unemp_dep, foreign_dep)]), 
+                   all.x = T, all.y = T, by = "dep") %>%
+  merge.data.table(distinct(census_comp[, .(dep, single_dep, highschool_dep)]), 
+                   all.x = T, all.y = T, by = "dep") %>%
+  merge.data.table(distinct(bdcom[, .(dep, density_dep)]), 
+                   all.x = T, all.y = T, by = "dep") %>%
+  merge.data.table(dads, all.x = T, all.y = T, by = "dep") %>%
+  merge.data.table(minc, all.x = T, all.y = T, by = "dep") %>%
+  merge.data.table(bpe, all.x = T, all.y = T, by = "dep") %>%
+  merge.data.table(min_dist_edu, all.x = T, all.y = T, by = "dep") %>%
+  merge.data.table(vote, all.x = T, all.y = T, by = "dep") %>%
+  merge.data.table(crime, all.x = T, all.y = T, by = "dep") %>%
+  # Divide crime and amenities by the population
+  .[, ":=" (pct_crimes_dep = nb_crime_dep / pop_dep,
+            amenities_dep = (cinemas_dep + museums_dep) / pop_dep)]
+
+# Both for the children and synthetic parent sample
+for (dat in c("children", "syn_parents")) {
+  assign(dat, get(dat) %>%
+           # Recode arrondissements for merger
+           .[depmun %chin% as.character(13201:13216), depmun := "13055"] %>%
+           .[depmun %chin% as.character(69381:69389), depmun := "69123"] %>%
+           # Merge municipality-level variables
+           merge.data.table(mun[, .(depmun, unemp_mun, foreign_mun, 
+                                    single_mun, pop_mun, density_mun)], 
+                            all.x = T, by = "depmun") %>%
+           # Merge department-level variables
+           merge.data.table(dep[, .(dep = as.numeric(dep), unemp_dep, gini_dep, 
+                                    foreign_dep, single_dep, highschool_dep, 
+                                    theil_dep,density_dep, pop_dep, lmean_wage_dep, 
+                                    sharetop1_dep, higher_edu_dep, dist_edu_dep, 
+                                    participation_dep, pct_crimes_dep, amenities_dep)], 
+                            all.x = T, by = "dep"))
+}
+
+fwrite(children, paste0(prj_dir, "data/children.csv"))
+fwrite(syn_parents, paste0(prj_dir, "data/syn_parents.csv"))
+fwrite(dep, paste0(prj_dir, "out/tab/dep_characteristics.csv"))
+```

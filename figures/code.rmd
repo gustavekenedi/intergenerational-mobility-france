@@ -1,0 +1,2825 @@
+---
+title: "Figures Journal of Public Economics"
+author: "Gustave"
+date: "27/07/2022"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Packages
+
+```{r}
+# Load packages
+packages <- c("here", "tidyverse", "data.table", "tidylog", "ggthemr", "scico", "patchwork", "cowplot", "haven", "sf", "magick", "scales", "readxl", "stringi", "glue", "ggtext", "broom", "plotly")
+librarian::shelf(packages, quiet = TRUE)
+rm(packages)
+```
+
+# Set working directories
+
+```{r}
+# set where raw data comes from
+data_intergen <- here("intergen_fr/figures_data/")
+data_psid <- here("psid_validation/figures_data/")
+  
+# set where final figures should go
+fig_final_path <- here("figures/out/")
+```
+
+# Figure parameters
+
+```{r}
+# ggplot graphs theme
+ggthemr::ggthemr('pale')
+
+# figure height and width
+figure_height = 6
+figure_width = 16/9 * figure_height
+
+alpha = 0.75
+text_size = 16
+
+my_palette = scico(5, palette = "lajolla", begin = .2, end = .95)
+```
+
+
+# Main Article
+
+## Fig 1. OLS vs. TSTSLS RRC - National and Census Regions in the United States
+
+```{r}
+dt <- read_rds(paste0(data_psid, "fig1_data_rrc.rds"))
+
+# National level plot
+#####################
+
+# Coefficients
+coefs_tstsls <- setDT(tidy(lm(rank_child ~ rank_parent_predict + factor(birth_year), dt)))
+coefs_ols <- setDT(tidy(lm(rank_child ~ rank_parent + factor(birth_year), dt)))
+
+nat_coefs <- data.table(n_obs = paste("<i style='color:#78695F;'>", 
+                                      formatC(nrow(dt), format = "d", big.mark = ","),
+                                      "observations</i>"),
+                        rrc_tstsls = sprintf("%.3f", as.numeric(coefs_tstsls[2, 2])),
+                        se_tstsls = sprintf("%.3f", as.numeric(coefs_ols[2, 3])),
+                        rrc_ols = sprintf("%.3f", as.numeric(coefs_ols[2, 2])),
+                        se_ols = sprintf("%.3f", as.numeric(coefs_ols[2, 3])),
+                        ols = "<b style='color:#823C37'>OLS</b>",
+                        ols2 = "<span style='color:#823C37'>(observed)</span>",
+                        tstsls = "<b style='color:#E99A52'>TSTSLS</b>",
+                        tstsls2 = "<span style='color:#E99A52'>(predicted)</span>") %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(everything(), names_to = "lab", values_to = "txt") %>%
+  mutate(mean_rank_child = case_when(lab == "n_obs"~ 6, grepl("se_", lab) ~ 33,
+                                     grepl("rrc_", lab) ~ 43, grepl("2", lab) ~ 58,
+                                     lab %in% c("ols", "tstsls") ~ 68),
+         rank_parent = case_when(lab == "n_obs"~ 85, grepl("ols", lab) ~  116,
+                                 grepl("tstsls", lab) ~  140)) %>% 
+  mutate(txt = ifelse(grepl("se", lab), paste0("(", txt, ")"), txt),
+         txt = ifelse(grepl("rrc", lab), paste0("<b>", txt, "</b>"), txt),
+         txt = ifelse(grepl("ols", lab), paste("<span style='color:#823C37'>", txt, "</span>"), txt),
+         txt = ifelse(grepl("tstsls", lab), paste("<span style='color:#E99A52'>", txt, "</span>"), txt))
+
+# Segments
+nat_seg <- data.table(parent_inc_var = c("Observed", "Predicted"), x = 1, xend = 100, 
+                      y = as.numeric(c(coefs_ols[1, 2], coefs_tstsls[1, 2])),
+                      yend = as.numeric(c(coefs_ols[1, 2] + 100*coefs_ols[2, 2], 
+                                          coefs_tstsls[1, 2] + 100*coefs_tstsls[2, 2])))
+
+#Plot
+graph_nat <- dt %>% 
+  select(rank_child, rank_parent, rank_parent_predict) %>% 
+  pivot_longer(cols = -rank_child, names_to = "parent_inc_var", values_to = "rank_parent") %>% 
+  mutate(parent_inc_var = case_when(parent_inc_var == "rank_parent" ~ "Observed",
+                                    parent_inc_var == "rank_parent_predict" ~ "Predicted")) %>% 
+  group_by(parent_inc_var, rank_parent) %>% 
+  summarise(mean_rank_child = mean(rank_child)) %>%
+  ggplot(aes(x = rank_parent, y = mean_rank_child)) +
+  geom_point(aes(color = parent_inc_var), alpha = alpha) +
+  geom_segment(data = nat_seg, aes(x = x, xend = xend, y = y, yend = yend, colour = parent_inc_var),  linewidth = 1, alpha = alpha) +
+  geom_richtext(data = nat_coefs, aes(label = txt), color = NA, fill = NA, size = 5) +
+  scale_y_continuous(lim = c(0,100), expand = c(0, 0)) +
+  scale_x_continuous(limits = c(1, 150), breaks = c(1, 25, 50, 75, 100), expand = c(0.01, 0.01)) +
+  scale_color_manual(values = my_palette[c(4,2)]) +
+  labs(x = "Parent household labor income rank",  y = "Mean child household\nincome rank", color = "Parent income:", title = "National") +
+  theme(legend.position = "none", text = element_text(size = 14), plot.title = element_text(size = 14))
+
+
+# Regional level plot
+#####################
+
+# Coefficients
+table_coefs <- lapply(c("South", "Midwest", "West", "Northeast"), function(x) {
+  
+  coefs_tstsls <- lm(rank_child ~ rank_parent_predict + factor(birth_year), 
+                     filter(dt, region == x)) %>% tidy() %>% setDT()
+  coefs_ols <- lm(rank_child ~ rank_parent + factor(birth_year), 
+                  filter(dt, region == x)) %>% tidy() %>% setDT()
+  
+  return(data.table(region = x,
+                    n_obs = paste("<i style='color:#78695F;'>", 
+                                  formatC(nrow(filter(dt, region == x)), 
+                                          format = "d", big.mark = ","),
+                                  "observations</i>"),
+                    rrc_tstsls = sprintf("%.3f", as.numeric(coefs_tstsls[2, 2])),
+                    se_tstsls = sprintf("%.3f", as.numeric(coefs_ols[2, 3])),
+                    aum_tstsls = sprintf("%.1f", as.numeric(coefs_tstsls[1, 2] + 
+                                                    25 * coefs_tstsls[2, 2])),
+                    rrc_ols = sprintf("%.3f", as.numeric(coefs_ols[2, 2])),
+                    se_ols = sprintf("%.3f", as.numeric(coefs_ols[2, 3])),
+                    aum_ols = sprintf("%.1f", as.numeric(coefs_ols[1, 2] + 
+                                                 25 * coefs_ols[2, 2])),
+                    ols = "<b style='color:#823C37'>OLS</b>",
+                    tstsls = "<b style='color:#E99A52'>TSTSLS</b>",
+                    rrc = "<i style='color:#5d5d5d'>RRC</i>",
+                    aum = "<i style='color:#5d5d5d'>AUM</i>"))
+  
+}) %>% rbindlist() %>%
+  mutate(across(everything(), as.character)) %>%
+  pivot_longer(-region, names_to = "lab", values_to = "txt") %>% 
+  mutate(mean_rank_child = case_when(lab == "n_obs"~ 6, grepl("rrc_", lab) ~ 55,  
+                                     grepl("se_", lab) ~ 40, grepl("aum_", lab) ~ 10, 
+                                     lab %in% c("ols", "tstsls") ~ 85,
+                                     lab == "rrc"~ 67, lab == "aum"~ 22),
+         rank_parent = case_when(lab == "n_obs" & grepl(",", txt) ~ 75,
+                                 lab == "n_obs" & !grepl(",", txt) ~ 77,
+                                 grepl("tstsls", lab) ~ 142,
+                                 grepl("ols", lab) ~ 115,  lab %in% c("rrc", "aum") ~ 128.5)) %>%
+  mutate(txt = ifelse(grepl("se", lab), paste0("(", txt, ")"), txt),
+         txt = ifelse(grepl("rrc_|aum_", lab), paste0("<b>", txt, "</b>"), txt),
+         txt = ifelse(grepl("_ols", lab), paste("<span style='color:#823C37'>", txt, "</span>"), txt),
+         txt = ifelse(grepl("_tstsls", lab), paste("<span style='color:#E99A52'>", txt, "</span>"), txt)) %>%
+  mutate(region = paste0("**Region: ", region, "**"))
+
+# Segments
+table_segments <- lapply(c("South", "Midwest", "West", "Northeast"), function(x) {
+  
+  coefs_tstsls <- lm(rank_child ~ rank_parent_predict + factor(birth_year), 
+                     filter(dt, region == x)) %>% tidy() %>% setDT()
+  coefs_ols <- lm(rank_child ~ rank_parent + factor(birth_year), 
+                  filter(dt, region == x)) %>% tidy() %>% setDT()
+  
+  return(data.table(region = x, 
+                    parent_inc_var = c("Observed", "Predicted"),
+                    x = 1, xend = 100, 
+                    y = as.numeric(c(coefs_ols[1, 2], coefs_tstsls[1, 2])),
+                    yend = as.numeric(c(coefs_ols[1, 2] + 100*coefs_ols[2, 2], 
+                             coefs_tstsls[1, 2] + 100*coefs_tstsls[2, 2]))))
+  
+}) %>% rbindlist()  %>%
+  mutate(region = paste0("**Region: ", region, "**"))
+
+# Plot
+graph_regions <- dt %>% 
+  select(rank_child, rank_parent, rank_parent_predict, region) %>% 
+  pivot_longer(cols = -c(rank_child, region),  names_to = "parent_inc_var", values_to = "rank_parent") %>% 
+  mutate(parent_inc_var = case_when(parent_inc_var == "rank_parent" ~ "Observed",
+                                    parent_inc_var == "rank_parent_predict" ~ "Predicted")) %>% 
+  group_by(parent_inc_var, rank_parent, region) %>% 
+  summarise(mean_rank_child = mean(rank_child)) %>%
+  filter(!is.na(region)) %>%
+  mutate(region = paste0("**Region: ", region, "**")) %>%
+  ggplot(aes(x = rank_parent, y = mean_rank_child)) +
+  geom_point(aes(color = parent_inc_var), alpha = alpha) +
+  geom_segment(data = table_segments, aes(x = x, xend = xend, y = y,  yend = yend, colour = parent_inc_var), linewidth = 1, alpha = alpha) +
+  geom_richtext(data = table_coefs, aes(label = txt), color = NA, fill = NA) +
+  scale_y_continuous(lim = c(0,100), expand = c(0, 0)) +
+  scale_x_continuous(limits = c(1, 150), breaks = c(1, 25, 50, 75, 100), expand = c(0.01, 0.01)) +
+  scale_color_manual(values = my_palette[c(4,2)]) +
+  labs(x = "Parent household labor income rank", y = "Mean child household\nincome rank",  color = "Parent income:") +
+  theme(legend.position = "none", text = element_text(size = 14), strip.text = element_markdown(hjust = 0, size = 14)) +
+  facet_wrap(~region)
+
+# Combine plots
+graph_nat / graph_regions + plot_layout(heights = c(0.4, 0.6))
+ggsave(paste0(fig_final_path, "fig1_psid_tstsls_ols_comp.pdf"), height = figure_height+1, width = figure_width)
+```
+
+## Fig 2. Out-of-Sample Predicted Labor Income Rank - France (EDP) and United States (PSID)
+
+```{r}
+psid_pred <- fread(paste0(data_psid, "fig2_baseline_indiv_prediction_rank_graphs.csv")) |> 
+  mutate(dataset = "PSID (United States)")
+
+edp_pred <- fread(paste0(data_intergen, "fig2_out_of_sample_cef.csv")) |> 
+  mutate(dataset = "EDP (France)") |> 
+  select(rank_parent = observed_rank,
+         mean_rank_parent_predict = predicted_rank,
+         p25_rank_parent_predict = predicted_rank_Q1,
+         p75_rank_parent_predict = predicted_rank_Q3,
+         dataset)
+
+both_pred <- bind_rows(psid_pred, edp_pred)
+
+both_pred |> 
+  ggplot(aes(x = rank_parent, y = mean_rank_parent_predict)) +
+  geom_point(aes(color = dataset), size = 2, alpha = alpha) +
+  geom_ribbon(aes(ymin = p25_rank_parent_predict, ymax = p75_rank_parent_predict, fill = dataset), alpha = 0.25, show.legend = F) +
+  geom_abline(slope = 1, colour = "black", linetype = 2) +
+  facet_wrap(vars(dataset)) +
+  scale_x_continuous(lim = c(0, 100), expand = c(0,0)) +
+  scale_y_continuous(lim = c(0, 100), expand = c(0,0)) +
+  scale_color_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  scale_fill_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  labs(x = "Observed labor income rank",
+       y = "Predicted labor income rank",
+       colour = "Dataset:") +
+  theme(legend.position = "none",
+        panel.spacing.x = unit(1, "cm"),
+        text = element_text(size = text_size),
+        strip.text.x = element_text(face = "bold"))
+ggsave(paste0(fig_final_path, "fig2_out_of_sample_cef_psid_edp_comp.pdf"), height = figure_height, width = figure_width)
+```
+
+
+## Fig 3. Conditional Expectation Functions for Log-Log and Rank-Rank Relationships in France
+
+```{r}
+## Log-log ----
+fig1A <- fread(paste0(data_intergen, "fig3A_cef_log_income_boot.csv"))
+
+cef_ige_graph <- ggplot(fig1A, aes(x = family_log_income_n, y = household_log_income)) + 
+  geom_point(size = 3, alpha = alpha, color = my_palette[3]) +
+  geom_vline(xintercept = c(fig1A$family_log_income_n[10], 
+                            fig1A$family_log_income_n[91]), 
+             linetype = "dashed", color = "black") +
+  geom_smooth(method = "lm", se = FALSE, formula = y ~ poly(x,3), color = my_palette[3]) +
+  annotate("text", x = 8.25, y = 10.88, 
+           label = paste0("IGE = ", round(unique(fig1A$coef), 2), 
+                          " (", round(unique(fig1A$boot_se), 3), ")\n",
+                          "IGE[Par. Inc. P10-P90] = ", round(unique(fig1A$coef_mid), 2), 
+                          " (", round(unique(fig1A$boot_se_mid), 3), ")\n"),
+           hjust = 0, size = 7) +
+  scale_y_continuous(breaks = seq(8.5,11,.25), expand = c(0.01, 0.01)) +
+  scale_x_continuous(lim = c(8.15,10.75), breaks = seq(8.5,11,.5), expand = c(0.01, 0.01)) +
+  labs(x = "Log parent household wage",
+       y = "Mean log child household income",
+       title = "Log-Log Relationship") +
+  theme(legend.position = "none",
+        text = element_text(size = text_size*1.5),
+        plot.title = element_text(face = "italic"))
+cef_ige_graph
+# ----
+
+# RRC CEF ----
+fig1B <- fread(paste0(data_intergen, "fig3B_cef_rank_boot.csv"))
+
+cef_rank_graph <- ggplot(fig1B, aes(x = family_rank, y = child_rank)) + 
+  geom_point(size = 3, alpha = alpha, color = my_palette[3]) +
+  geom_smooth(method = "lm", se = FALSE, formula = y ~ poly(x,3), color = my_palette[3]) +
+  geom_vline(xintercept = c(10, 90), linetype = "dashed", color = "black") + 
+  annotate("text", x = 12, y = 68, 
+           label = paste0("RRC = ", round(unique(fig1B$coef), 2), 
+                          " (", round(unique(fig1B$boot_se), 3), ")\n",
+                          "RRC[Par. Inc. P10-P90] = ", round(unique(fig1B$coef_mid), 2), 
+                          " (", round(unique(fig1B$boot_se_mid), 3), ")\n"),
+           hjust = 0, size = 7) +
+  scale_x_continuous(expand = c(0.01, 0.01)) +
+  scale_y_continuous(lim = c(32, 75), breaks = seq(35, 100, 10), expand = c(0.01, 0.01)) +
+  labs(x = "Parent household wage rank",
+       y = "Mean child household income rank",
+       title = "Rank-Rank Relationship") +
+  theme(legend.position = "none",
+        text = element_text(size = text_size*1.5),
+        plot.title = element_text(face = "italic"))
+cef_rank_graph
+# ----
+
+# IGE + RRC CEFs in same graph ----
+patchwork <- cef_ige_graph + cef_rank_graph
+patchwork +
+  plot_annotation(tag_levels = "A")
+ggsave(paste0(fig_final_path, "fig3_cefs.pdf"), height = 9/16*15, width = 20)
+# ----
+```
+
+## Fig 4. Baseline Quintile Transition Matrix for Different Countries
+
+```{r}
+# Baseline transition matrix - Comparison with US and Australia ----
+fig2 <- fread(paste0(data_intergen, "fig4_tm_boot.csv")) %>%
+  mutate(lab = paste0(round(100*share, 1), "%"),
+         #lab = paste0(round(100*share, 1), "%\n(", round(boot_se, 3), ")"),
+         pct = str_remove(pct, "%"),
+         parent_qtile = factor(family_quintile, levels = 1:5, labels = c("Bottom 20%", "2", "3", "4", "Top 20%")),
+         child_qtile = factor(child_quintile, levels = 1:5, labels = c("Bottom 20%", "2", "3", "4", "Top 20%")),
+         country = "France")
+
+matrix_us <- data.frame(country = "United States",
+                        parent_qtile = rep(c("Bottom 20%",2,3,4,"Top 20%"), each = 5),
+                        child_qtile = rep(c("Bottom 20%",2,3,4,"Top 20%"), 5),
+                        pct = c(33.7, 28.0, 18.4, 12.3, 7.5, 24.2, 24.2, 21.7, 17.6, 12.3, 17.8, 19.8, 22.1, 22.0, 18.3, 13.4, 16.0, 20.9, 24.4, 25.4, 10.9, 11.9, 17.0, 23.6, 36.5)) %>%
+  mutate(lab = paste0(pct, "%"))
+
+matrix_aus <- data.frame(country = "Australia",
+                         parent_qtile = rep(c("Bottom 20%",2,3,4,"Top 20%"), each = 5),
+                         child_qtile = rep(c("Bottom 20%",2,3,4,"Top 20%"), 5),
+                         pct = c(31.0, 22.7, 18.5, 15.5, 12.3, 21.8, 22.3, 21.1, 19.0, 15.9, 18.0, 20.9, 21.5, 21.1, 18.6, 15.3, 18.7, 21.0, 22.6, 22.5, 14.0, 15.4, 18.0, 21.9, 30.7)) %>%
+  mutate(lab = paste0(pct, "%"))
+
+matrix <- rbind(fig2 %>% select(country, parent_qtile, child_qtile, pct, lab), matrix_us, matrix_aus) %>% arrange(country, parent_qtile, child_qtile)
+
+matrix %>%
+  mutate(country = fct_relevel(country, "France", "United States", "Australia"),
+         pct = as.numeric(pct)) %>%
+  ggplot(aes(x = factor(parent_qtile), y = pct, fill = forcats::fct_rev(factor(child_qtile)), label = lab)) +
+  geom_bar(stat = "identity", alpha = alpha) +
+  geom_text(size = 4, position = position_stack(vjust = 0.5), col = "white") +
+  facet_grid(cols = vars(country)) +
+  scale_y_continuous(breaks = seq(0,100,20), expand = c(0,0)) +
+  labs(
+    x = "Parent income quintile",
+    y = NULL,
+    fill = "Child income quintile:"
+  ) +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        legend.key = element_rect(size = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(1, "cm"),
+        legend.key.width = unit(1, "cm"),
+        axis.text.x = element_text(size = 11),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 12, face = "italic"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid.major = element_blank()) +
+  scale_fill_manual(values = alpha(my_palette[c(5,4,3,2,1)], alpha), guide = guide_legend(reverse = TRUE))
+ggsave(paste0(fig_final_path, "fig4_matrix_baseline.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+## Fig 5. Graduation From/Enrollment In Higher Education by Parent Income
+
+```{r}
+# Higher edu
+data_fr <- fread(paste0(data_intergen, "fig5_higher_edu_cef.csv")) %>%
+  mutate(country = "France",
+         college = child_edu)
+
+data_us <- read_dta(here("figures/other_data/chetty_et_al_2020_qje/paper_fig_1a.dta")) %>%
+  mutate(country = "United States",
+         type = "enrollment",
+         family_rank = par_agi_pctile + 1,
+         college = cg22_80/100) %>%
+  select(country, type, family_rank, college)
+
+data <- bind_rows(data_fr, data_us)
+
+data %>%
+  ggplot(aes(x = family_rank, y = college, color = country)) +
+  geom_point() + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = F) +
+  scale_color_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  geom_text(data = tibble(family_rank = c(65, 70), 
+                          college = c(.82, .45), 
+                          country = c("United States", "France"),
+                          Type = c("Has been enrolled in higher education", "Has graduated from higher education"),
+                          type_order = 2), show.legend = F, size = 5, 
+            label = c("Enrollment \n(Chetty et al., 2020)", "Graduation")) +
+  scale_x_continuous(name = "Parent income rank", expand = c(0.01, 0.01)) + 
+  scale_y_continuous(name = "Higher education enrollment/graduation", limits = 0:1, breaks = c(0, .25, .5, .75, 1),
+                     labels = c("0%", "25%", "50%", "75%", "100%"), expand = c(0,0)) +
+  labs(color = "Country:") +
+  guides(color = guide_legend(reverse = T)) +
+  theme(strip.text = element_blank(),
+        strip.placement = "outside",
+        panel.spacing.y = unit(0.3, "cm"),
+        text = element_text(size = text_size),
+        panel.spacing = unit(3, "lines"),
+        legend.position = c(0.01,.99), 
+        legend.justification = c(0,1), 
+        legend.direction = "vertical",
+        legend.title = element_text(size = 12, face = "italic"))
+ggsave(paste0(fig_final_path, "fig5_higher_edu_chetty2020.pdf"), height = figure_height, width = figure_width)
+```
+
+## Fig 6. Child Lifecycle Bias
+
+```{r}
+fig4 <- fread(paste0(data_intergen, "fig6_child_lifecycle_boot.csv")) %>%
+  mutate(sample = factor(sample, levels = c("Tax data", "All Employee Panel"), labels = c("Household income", "Individual wage (All Employee Panel)")))
+
+# Baseline IGE Child Lifecycle bias ----
+ige_childlifecycle_graph <- fig4 %>% 
+  filter(estimate == "IGE") %>%
+  ggplot(aes(x = age, y = coef, linetype = sample, shape = sample)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), 
+              alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(-.5, .6), breaks = seq(-.5,.6,.1), expand = c(0,0)) +
+  scale_x_continuous(breaks = seq(20,44,4), expand = c(0.01, 0.01)) +
+  labs(x = NULL,
+       y = NULL,
+       linetype = NULL,
+       shape = NULL,
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_childlifecycle_graph
+# ----
+
+# Baseline RRC Child Lifecycle bias ----
+rrc_childlifecycle_graph <- fig4 %>%
+  filter(estimate == "RRC") %>%
+  ggplot(aes(x = age, y = coef, linetype = sample, shape = sample)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), 
+              alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(-0.2, .35), breaks = seq(-.2,.35,.1), expand = c(0, 0)) +
+  scale_x_continuous(breaks = seq(20,44,4), expand = c(0.01, 0.01)) +
+  labs(x = "Child age",
+       y = NULL,
+       linetype = NULL,
+       shape = NULL,
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_childlifecycle_graph
+# ----
+
+# P(5,5) and P(1,5) Child Lifecycle bias ----
+fig4_mat <- fig4 %>%
+  filter(estimate == "TM") %>% 
+  mutate(group = factor(group, levels = c("Bot->Bot", "Bot->Top", "Top->Bot", "Top->Top"), labels = c("Bot. 20% to Bot. 20%", "Bot. 20% to Top 20%", "Top 20% to Bot. 20%", "Top 20% to Top 20%"))) %>% setDT()
+
+matrix_childlifecycle_graph <- fig4_mat %>%
+  ggplot(aes(x = age, y = coef, fill = factor(group), linetype = sample, shape = sample)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), show.legend = F) +
+  geom_point(aes(col = factor(group)), show.legend = FALSE) +
+  geom_line(aes(col = factor(group)), show.legend = FALSE) +
+  geom_text(data = fig4_mat[group == "Bot. 20% to Bot. 20%" & age == 29 & sample != "Household income"], aes(y = coef, label = group), hjust = 0, nudge_y = -0.02) +
+  geom_text(data = fig4_mat[group == "Bot. 20% to Top 20%" & age == 29 & sample != "Household income"], aes(y = coef, label = group), hjust = 0, nudge_y = -.02) +
+  geom_text(data = fig4_mat[group == "Top 20% to Bot. 20%" & age == 29 & sample != "Household income"], aes(y = coef, label = group), hjust = 0, nudge_y = 0.01) +
+  geom_text(data = fig4_mat[group == "Top 20% to Top 20%" & age == 29 & sample != "Household income"], aes(y = coef, label = group), hjust = 0, nudge_y = .03) +
+  scale_x_continuous(breaks = seq(20,44,4), expand = c(0.01, 0.01)) +
+  scale_y_continuous(lim = c(0,.43), labels = scales::percent_format(1), expand = c(0,0)) +
+  scale_colour_manual(values = alpha(my_palette[c(1,2,4,5)], alpha)) +
+  scale_fill_manual(values = alpha(my_palette[c(1,2,4,5)], .2)) +
+  scale_linetype_discrete(labels = c("Household income", "Individual wage (All Employee Panel)")) +
+  scale_shape_discrete(labels = c("Household income", "Individual wage (All Employee Panel)")) +
+  labs(x = NULL,
+       y = NULL,
+       col = NULL,
+       linetype = NULL,
+       shape = NULL,
+       title = "Transition Matrix") +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic")) +
+  guides(color = "none")
+matrix_childlifecycle_graph
+# ----
+
+# All together Child Lifecycle bias ----
+patchwork <- ige_childlifecycle_graph + rrc_childlifecycle_graph + matrix_childlifecycle_graph
+patchwork + plot_annotation(tag_levels = "A") + plot_layout(guides = "collect") & theme(legend.position = "top")
+ggsave(paste0(fig_final_path, "fig6_all_childlifecycle.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+## Fig 7. Parent Lifecycle Bias
+
+```{r}
+fig5 <- fread(paste0(data_intergen, "fig7_parents_lifecycle_boot.csv"))
+
+# IGE Parent Lifecycle bias ----
+ige_parentlifecycle_graph <- fig5 %>%
+  filter(estimate == "IGE") %>%
+  ggplot(aes(x = age, y = coef)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), 
+              alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .6), breaks = seq(0,.6,.1), expand = c(0, 0)) +
+  scale_x_continuous(lim = c(25,60), breaks = seq(25,60,5), expand = c(0.01, 0.01)) +
+  labs(x = NULL,
+       y = NULL,
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_parentlifecycle_graph
+# ----
+
+# RRC Parent Lifecycle bias ----
+rrc_parentlifecycle_graph <- fig5 %>%
+  filter(estimate == "RRC") %>%
+  ggplot(aes(x = age, y = coef)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), 
+              alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .4), breaks = seq(0,.4,.1)) +
+  scale_x_continuous(lim = c(25,60), breaks = seq(25,60,5)) +
+  labs(x = "Synthetic parent age",
+       y = NULL,
+       title = "Rank-Rank Correlation") +
+  theme(text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_parentlifecycle_graph
+# ----
+
+# P(5,5) and P(1,5) Child Lifecycle bias ----
+fig5_mat <- fig5 %>%
+  filter(estimate == "TM") %>%
+  mutate(group = factor(group, levels = c("Bot->Bot", "Bot->Top", "Top->Bot", "Top->Top"), labels = c("Bot. 20% to Bot. 20%", "Bot. 20% to Top 20%", "Top 20% to Bot. 20%", "Top 20% to Top 20%"))) %>% setDT()
+
+matrix_parentlifecycle_graph <- fig5_mat %>%
+  ggplot(aes(x = age, y = coef)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se, fill = factor(group)), show.legend = F) +
+  geom_point(aes(col = factor(group))) +
+  geom_line(aes(col = factor(group))) +
+  geom_text(data = fig5_mat[group == "Bot. 20% to Bot. 20%" & age == 30], aes(y = coef, label = group), hjust = 0, nudge_y = .02, nudge_x = 4) +
+  geom_text(data = fig5_mat[group == "Bot. 20% to Top 20%" & age == 30], aes(y = coef, label = group), hjust = 0, nudge_y = -.08, nudge_x = 4) +
+  geom_text(data = fig5_mat[group == "Top 20% to Bot. 20%" & age == 30], aes(y = coef, label = group), hjust = 0, nudge_y = .01, nudge_x = 4) +
+  geom_text(data = fig5_mat[group == "Top 20% to Top 20%" & age == 30], aes(y = coef, label = group), hjust = 0, nudge_y = .06, nudge_x = 4) +
+  scale_x_continuous(lim = c(25,60), breaks = seq(25,60,5)) +
+  scale_y_continuous(lim = c(0,.415), labels = scales::percent_format(1)) +
+  scale_fill_manual(values = alpha(my_palette[c(1,2,4,5)], .2)) +
+  scale_colour_manual(values = alpha(my_palette[c(1,2,4,5)], alpha)) +
+  labs(x = NULL,
+       y = NULL,
+       col = NULL,
+       title = "Transition Matrix") +
+  theme(legend.position = "none",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+matrix_parentlifecycle_graph
+# ----
+
+# All together Child Lifecycle bias ----
+patchwork <- ige_parentlifecycle_graph + rrc_parentlifecycle_graph + matrix_parentlifecycle_graph
+patchwork + plot_annotation(tag_levels = "A")
+ggsave(paste0(fig_final_path, "fig7_all_parentlifecycle.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+## Fig 8. Spatial Variations in Intergenerational Mobility
+
+```{r}
+data_igm <- read.csv(paste0(data_intergen, "fig8_dep_IGM.csv"))
+
+# Geofla Départements édition 2016 France Métropolitaine (https://geoservices.ign.fr/geofla)
+dep_shp <- read_sf(here("figures/other_data/shapefile/DEPARTEMENT.shp"))
+
+# Prepare data
+##############
+
+myshp <- dep_shp %>%
+  # Recode Corsica department
+  mutate(dep = as.numeric(ifelse(CODE_DEPT %in% c("2A", "2B"), "20", CODE_DEPT))) %>%
+  # Merge Corsica geometry
+  group_by(dep) %>% summarise(geometry = st_union(geometry)) %>%
+  # Join IGM estimates
+  right_join(data_igm)
+
+# Prepare color scales 
+######################
+
+# functions floor and ceiling at decimal level for scales
+fdec <- function(x, dec) {return(round(x - (5*10^(-dec-1)), dec))}
+cdec <- function(x, dec) {return(round(x + (5*10^(-dec-1)), dec))}
+
+type <- "quantiles"
+nquantiles <- 8
+ascending_palette <- scico(nquantiles + 2, palette = 'lajolla')[1:nquantiles]
+descending_palette <- tibble(palette = ascending_palette) %>%
+  mutate(n = row_number()) %>% 
+  arrange(-n) %>% 
+  select(palette) %>% 
+  deframe()
+
+# IGM estimates
+###############
+
+for (estimator in c("ige", "rrc", "aum")) {
+  
+  # Compute quantiles 
+  temp_estimator <- estimator
+  myshp <- myshp %>%
+    mutate(isna = ifelse(is.na(get(estimator)), 1, 0)) %>%
+    group_by(isna) %>%
+    arrange(eval(parse(text = estimator))) %>%
+    mutate(qgroup = ceiling(nquantiles * (row_number() / n()))) %>%
+    group_by(isna, qgroup) %>%
+    mutate(!!paste0("qt_", estimator) := ifelse(isna == 0,
+                                                paste0(round(min(get(estimator)), 3), " - ", 
+                                                       round(max(get(estimator)), 3)) , NA)) %>%
+    ungroup()
+  temp_estimator <- paste0("qt_", estimator)
+  
+  # Plot results 
+  temp_plot <- ggplot() +
+    geom_sf(data = myshp, mapping = aes(fill = get(temp_estimator)), color = "grey60", lwd = .1) +
+    #theme_minimal() +
+    theme(axis.text = element_blank(),
+          axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          panel.grid.major = element_line(colour = "transparent"),
+          text = element_text(size = 18),
+          legend.position = c(.98, .55)) 
+  
+  
+  # Conditional scale
+  if (estimator == "aum") {
+    temp_plot <- temp_plot +
+      scale_fill_manual(name = "", values = descending_palette, na.value = "grey80")
+  } else {
+    temp_plot <- temp_plot +
+      scale_fill_manual(name = "", values = ascending_palette, na.value = "grey80")
+  }
+  
+  outplot <- paste0(fig_final_path, "fig8_map_", estimator, ".png")
+  ggsave(outplot, height = 6, width = (16 * 6 )/9)
+  
+  # Zoom on IDF
+  crd <- 75
+  squaredIDF <- image_crop(image_read(outplot),
+                           geometry = paste0(crd, "x", crd, "+", 1545, "+", 438),
+                           repage = T)
+  blank_fig <- image_draw(image_blank(150, 150))
+  symbols(crd/2, crd/2, circles = (crd/2) - 3, bg = "black", inches = F, add = T)
+  dev.off()
+  circleIDF <- image_composite(squaredIDF, blank_fig, operator= "copyopacity")
+  zoomIDF <- image_draw(image_composite(image_read(outplot),
+                                        image_scale(circleIDF, "x175"),
+                                        offset = "+2000+80"))
+  lines(c(2016, 1575), c(206, 470))
+  zoomIDF <- image_annotate(zoomIDF, "Insufficient data", size = 59,color = "#444444",
+                            location = "+2419+1115", boxcolor = "white")
+  dev.off()
+  image_crop(zoomIDF, "2100x1800+550")
+  image_write(zoomIDF, outplot)
+  image_write(image_crop(image_read(outplot), 
+                         geometry_area(width = 2200, height = 1800,
+                                       x_off = 700, y_off = 0)), outplot)
+}
+```
+
+## Fig 9. Intergenerational Mobility and Department Characteristics - Separate Estimation
+
+```{r}
+fig9 <- fread(paste0(data_intergen, "fig9_separate_regressions_boot.csv"))
+
+label <- c("Density", "% Foreigners", "% Single mothers",
+           "Mean wage", "% Unemployed",
+           "Gini index", "Theil index", "Share top 1%",
+           "# HEI", "Distance to HEI", "% HS graduates",
+           "Crime", "% Voters", "Cultural amenities")
+
+var_group <- c(rep("Demographic", 3),
+               rep("Economic", 2),
+               rep("Inequality", 3),
+               rep("Education", 3),
+               rep("Social capital", 3))
+
+igm_cor <- fig9 %>%
+  mutate(var_group = case_when(var %in% c("density_dep", "single_dep", "foreign_dep") ~ "Demographic",
+                               var %in% c("lmean_wage_dep", "unemp_dep") ~ "Economic",
+                               var %in% c("dist_edu_dep", "highschool_dep", "higher_edu_dep") ~ "Education",
+                               var %in% c("theil_dep", "sharetop1_dep", "gini_dep") ~ "Inequality",
+                               var %in% c("amenities_dep", "pct_crimes_dep", "participation_dep") ~ "Social Capital"),
+         label = case_when(var == "density_dep" ~ "Density",
+                           var == "single_dep" ~ "% Single mothers",
+                           var == "foreign_dep" ~ "% Foreigners",
+                           var == "lmean_wage_dep" ~ "Mean wage",
+                           var == "unemp_dep" ~ "Unemployment rate",
+                           var == "dist_edu_dep" ~ "Distance to HEI",
+                           var == "highschool_dep" ~ "% HS graduates",
+                           var == "higher_edu_dep" ~ "# HEI",
+                           var == "theil_dep" ~ "Theil index",
+                           var == "sharetop1_dep" ~ "Share top 1%",
+                           var == "gini_dep" ~ "Gini index",
+                           var == "amenities_dep" ~ "Cultural amenities",
+                           var == "pct_crimes_dep" ~ "Criminality",
+                           var == "participation_dep" ~ "% Voters"))
+
+plot_cor <- function(data = igm_cor, igm_measure) {
+  data %>%
+  filter(measure == igm_measure) %>%
+  ggplot(aes(y = label, x = coef, color = var_group)) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "gray20") +
+    geom_pointrange(aes(xmin = lb, xmax = ub, color = var_group)) +
+  facet_wrap(~ var_group, ncol = 1, scales = "free_y", strip.position = "left") +
+  labs(x= NULL, y = NULL, title = igm_measure) +
+  scale_x_continuous(limits = c(-.78, .78), breaks = round(seq(-.6, .6, .2),1), expand = c(0,0)) +
+  scale_color_manual(values = my_palette[c(5,4,3,2,1)]) +
+  theme(plot.title = element_text(size = 14, face = "italic"),
+        legend.position = "none", 
+        legend.justification = "left", 
+        legend.direction = "vertical",
+        strip.placement = "outside",
+        strip.text.y = element_text(face = "bold", size = 10),
+        panel.spacing.y = unit(0.3, "cm"),
+        strip.text.x = element_text(face = "bold"),
+        text = element_text(size = text_size),
+        panel.spacing = unit(3, "lines"))
+}
+
+cor_ige = plot_cor(igm_measure = "ige") +
+  labs(title = "Intergenerational Elasticity")
+cor_ige
+
+cor_rrc = plot_cor(igm_measure = "rrc") +
+  labs(title = "Rank-Rank Correlation", x = "Correlation") +
+  theme(strip.text.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank())
+cor_rrc
+
+cor_aum = plot_cor(igm_measure = "aum") +
+  labs(title = "Absolute Upward Mobility") +
+  theme(strip.text.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank())
+cor_aum
+
+cor_ige + cor_rrc + cor_aum
+ggsave(paste0(fig_final_path, "fig9_cor_dep_fullset.pdf"), height = figure_height, width = figure_width)
+```
+
+## Fig 10. Intergenerational Mobility and Geographic Mobility
+
+```{r}
+# Mobility rank
+fig10 <- fread(paste0(data_intergen, "fig10_mobility_nat_rank.csv"))
+
+pct_movers <- read.csv(paste0(data_intergen, "in_text_figures.csv")) %>%
+  filter(Label == "%movers all") %>% pull(Figure)
+
+fig10 %>%
+  ggplot(aes(x = family_income_n_spatial_household_income_rank, y = child_rank, color = factor(mobility))) + 
+  geom_point(alpha = alpha) +
+  geom_smooth(method = "lm", se = F, formula = y ~ poly(x, 3, raw = T)) +
+  scale_color_manual(values = rev(alpha(my_palette[c(4,2)], alpha)), name = "Mobility:", 
+                     labels = c(paste0("Stayers (", 100 - round(100*pct_movers, 1), "%)"), 
+                                paste0("Movers (", round(100*pct_movers, 1), "%)"))) +
+  labs(x = "Parent household wage rank") +
+  scale_y_continuous(name = "Mean child household income rank", 
+                     limits = c(20, 80),  breaks = seq(20,80,10), expand = c(0,0)) +
+  theme(legend.position = c(0.01,.99), 
+        legend.justification = c(0,1),
+        legend.direction = "vertical",
+        legend.title = element_text(size = 12, face= "italic"),
+        text = element_text(size = text_size)) +
+  guides(color = guide_legend(reverse = T))
+
+ggsave(paste0(fig_final_path, "fig10_cef_rank_mobility.pdf"), height = figure_height, width = figure_width)
+```
+
+## Fig 11. Mean Income Rank of Origin and Destination Departments of Movers
+
+```{r}
+fig11 <- fread(paste0(data_intergen, "fig11_origin_destin_mean_rank.csv"))
+
+fig11 %>% 
+  mutate(origin_destination = case_when(variable == "origin_dep_rank" ~ "Origin Department",
+                                        variable == "destin_dep_rank" ~ "Destination Department"),
+         pct = n/sum(n) * 100) %>% 
+    ggplot(aes(x = family_ventile, y = value, color = origin_destination, size = pct)) +
+  geom_point(alpha = alpha) +
+  geom_smooth(se = F, method = "lm", formula = y ~ poly(x,2), show.legend = F) +
+  scale_color_manual(values = alpha(my_palette[c(4,2)], alpha), guide = guide_legend(order = 1)) +
+  xlab("Parent household wage ventile") + labs(color = NULL, size = "Percentage of observations:") +
+  scale_y_continuous(name = "Mean department income rank\n(origin = parents, destination = children)", 
+                     limits = c(49.5, 56.5),  breaks = seq(20,80,2), expand = c(0,0)) +
+  scale_size(breaks = c(2, 2.5, 3.5), guide = guide_legend(order = 2)) +
+  theme(legend.position = c(0.01,.99), 
+        legend.justification = c(0,1),
+        legend.direction = "vertical",
+        legend.box = "horizontal",
+        legend.title = element_text(size = 12, face= "italic"),
+        text = element_text(size = text_size))
+ggsave(paste0(fig_final_path, "fig11_cef_rank_mobility_origin_dest_ventile.pdf"), height = figure_height, width = figure_width)
+```
+
+## Fig 12. Mean Child Income Rank by Destination Department Mean Income
+
+```{r}
+fig12 <- fread(paste0(data_intergen, "fig12_cef_destination.csv"))
+
+fig12_figures <- read.csv(paste0(data_intergen, "in_text_figures.csv")) %>%
+  filter(grepl("^dep rank", Label)) %>% 
+  select(Label, Figure) %>%
+  mutate(Label = sub("dep rank ", "", Label)) %>% 
+  separate(Label, c("type", "stat"), " ") %>%
+  pivot_wider(names_from = "stat", values_from = "Figure") %>%
+  mutate(share_movers = round(100*share_movers)) %>%
+  as.data.table()
+
+lab_high <- paste0("High income (", fig12_figures[type == "High"]$n_dep - 1, 
+                   " dep. + foreign; ", fig12_figures[type == "High"]$share_movers, "% of movers)")
+lab_medium <- paste0("Medium income (", fig12_figures[type == "Medium"]$n_dep - 1, 
+                     " dep. + overseas; ", fig12_figures[type == "Medium"]$share_movers, "% of movers)")
+lab_low <- paste0("Low income (", fig12_figures[type == "Low"]$n_dep, 
+                  " dep.; ", fig12_figures[type == "Low"]$share_movers, "% of movers)")
+lab_stayers <- paste0("Stayers (", round(100*(1-pct_movers), 1), "%)")
+
+fig12 %>%
+  mutate(inc_to_lab = case_when(dep_type == "High" ~ lab_high,
+                                dep_type == "Medium" ~ lab_medium,
+                                dep_type == "Low" ~ lab_low,
+                                dep_type == "Stayers" ~ lab_stayers),
+         inc_to_lab = fct_relevel(inc_to_lab, lab_high, lab_medium, lab_low, lab_stayers),
+         pct = n/sum(n)*100) %>% 
+  ggplot(aes(x = family_ventile, y = child_rank, color = inc_to_lab, size = pct)) +
+  geom_point(alpha = alpha) +
+  geom_smooth(se = F, method = "lm", formula = y ~ poly(x,2), show.legend = F) +
+  scale_color_manual(values = alpha(my_palette[c(5,4,3,2)], alpha), guide = guide_legend(order = 1)) +
+  xlab("Parent household wage ventile") + labs(color = NULL, size = "Percentage of observations:") +
+  scale_y_continuous(name = "Mean child household income rank", 
+                     limits = c(30, 81),  breaks = seq(20,90,10), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,20), expand = c(0.01, 0.01)) +
+  scale_size(breaks = c(0.5,1,3), guide = guide_legend(order = 2)) +
+  theme(legend.position = c(0.01,.99), 
+        legend.justification = c(0,1),
+        legend.direction = "vertical",
+        legend.box = "horizontal",
+        legend.title = element_text(size = 12, face= "italic"),
+        text = element_text(size = text_size))
+ggsave(paste0(fig_final_path, "fig12_cef_rank_mobility_dest_inc_cat_ventile.pdf"), height = figure_height, width = figure_width)
+```
+
+
+# Appendices
+
+## Appendix B
+
+The code for the figures in this Appendix can be found in `psid_validation/code/psid_results.qmd`. The figures themselves can be found in `figures/out/appendix B/`.
+
+## Appendix C
+
+### Fig C1. Robustness of Baseline Estimates to Computing Synthetic Parent Incomes only on Post-1988 Data
+
+```{r}
+figC1 <- fread(paste0(data_intergen, "figC1_post_88_income_boot.csv")) %>% 
+  mutate(ci_low = coef - 1.96 * boot_se,
+             ci_high = coef + 1.96 * boot_se,
+             inc_period = case_when(inc_period == "" ~ "Baseline",
+                                    inc_period == "_post_88" ~ "Post-1988"),
+             sample = factor(subsample, levels = c("FM", "M", "F"), labels = c("All", "Sons", "Daughters")))
+
+ige_post1988_graph = figC1 %>% 
+  filter(estimate == "IGE") %>% 
+  ggplot(aes(x = sample, y = coef, fill = inc_period)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .5), width = .4, alpha = alpha) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), position = position_dodge(width = .5), color = "black", width = .1) +
+  geom_text(aes(y = ci_high + 0.015, label = substr(as.character(round(coef, 2)),2,4), color = estimate), position = position_dodge(width = .5), show.legend = FALSE, size = 4) +
+  scale_fill_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  scale_color_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  scale_y_continuous(limits = c(0, .64), breaks = seq(0,1,.1), expand = c(0,0)) +
+  labs(x = NULL,
+       y = NULL,
+       fill = "Estimate:",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        plot.title = element_text(size = 14, face = "italic"),
+        text=element_text(size = text_size),
+        panel.spacing = unit(1.5, "lines"),
+        panel.grid.major.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 1))
+ige_post1988_graph
+
+rrc_post1988_graph = figC1 %>%
+  filter(estimate == "RRC") %>%
+  mutate() %>%
+  ggplot(aes(x = sample, y = coef, fill = inc_period)) +
+  geom_bar(stat="identity", position = position_dodge(width = .5), width = .4, alpha = alpha) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), position = position_dodge(width = .5), color = "black", width = .1) +
+  geom_text(aes(y = ci_high + 0.015, label = substr(as.character(round(coef, 2)),2,4), color = estimate), position = position_dodge(width = .5), show.legend = FALSE, size = 4) +
+  scale_fill_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  scale_color_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  scale_y_continuous(limits = c(0, .4), breaks = seq(0,1,.1), expand = c(0,0)) +
+  labs(x = NULL,
+       y = NULL,
+       fill = "Estimate:",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        plot.title = element_text(size = 14, face = "italic"),
+        text=element_text(size = text_size),
+        panel.spacing = unit(1.5, "lines"),
+        panel.grid.major.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 1))
+rrc_post1988_graph
+
+matrix_post1988_graph = figC1 %>%
+  filter(estimate == "TM" & sample == "All") %>%
+  mutate(transition = case_when(group == "Bot->Bot" ~ "P(Bot. 20% | \nBot. 20%)",
+                                group == "Top->Bot" ~ "P(Bot. 20% | \nTop 20%)",
+                                group == "Bot->Top" ~ "P(Top 20% | \nBot. 20%)",
+                                group == "Top->Top" ~ "P(Top 20% | \nTop 20%)"),
+         transition = fct_relevel(transition, "P(Bot. 20% | \nBot. 20%)", "P(Top 20% | \nBot. 20%)", "P(Top 20% | \nTop 20%)", "P(Bot. 20% | \nTop 20%)")) %>%
+  ggplot(aes(x = transition, y = coef, fill = inc_period)) +
+  geom_bar(stat="identity", position = position_dodge(width = .5), width = .4, alpha = alpha) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), position = position_dodge(width = .5), color = "black", width = .1) +
+  geom_text(aes(y = coef + .02, label = paste0(round(coef*100, 1), "%"), color = inc_period), position = position_dodge(width = 1.3), show.legend = FALSE, size = 4) +
+  scale_fill_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  scale_color_manual(values = alpha(my_palette[c(4,2)], alpha)) +
+  scale_y_continuous(limits = c(0, .42), breaks = seq(0,1,.1), expand = c(0,0), labels = scales::percent_format(1)) +
+  labs(x = NULL,
+       y = NULL,
+       fill = "Estimate:",
+       title = "Transition Matrix") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        plot.title = element_text(size = 14, face = "italic"),
+        text=element_text(size = text_size),
+        axis.text.x = element_text(size = 7.5),
+        panel.spacing = unit(1.5, "lines"),
+        panel.grid.major.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 1))
+matrix_post1988_graph
+
+ige_post1988_graph + rrc_post1988_graph + matrix_post1988_graph + plot_annotation(tag_levels = "A") + plot_layout(guides = "collect") & theme(legend.position = "top")
+ggsave(paste0(fig_final_path, "/appendix C/figC1_all_post1988.pdf"),
+       height = figure_height, width = figure_width)
+```
+
+### Fig C2. Robustness of Baseline Estimates to Different First-Stage Predictors
+
+```{r}
+# Robust instruments ----
+
+# IGE graph
+figC2A <- fread(paste0(data_intergen, "figC2A_log_cefs_instru_boot.csv")) %>% 
+  mutate(instru = fct_recode(instru, "+ 2-digit occ." = "+ 2digit occ.", "+ city char." = "+ mun. char."),
+         first_stage_lab_ordered = fct_relevel(instru, "Education", "+ 2-digit occ.", "+ demographic char.", "+ city char."))
+
+ige_labs <- figC2A %>% 
+  select(coef, boot_se, first_stage_lab_ordered) %>%
+  unique() %>% 
+  mutate(family_log_income_n = 8.25,
+         household_log_income = 11.1)
+
+graph_coef_ige <- figC2A %>%
+  ggplot(aes(x = family_log_income_n, y = household_log_income)) +
+  geom_point(size = 3, alpha = alpha, color = my_palette[3]) +
+  geom_smooth(method = "lm", se = FALSE, formula = y ~ poly(x,3), color = my_palette[3]) +
+  geom_text(data = ige_labs,
+            aes(label = paste0("IGE = ", round(coef, 2), " (", round(boot_se,3), ")")), hjust = 0, size = 5) +
+  scale_y_continuous(breaks = seq(8.5,11,.25)) +
+  scale_x_continuous(lim = c(8.15,10.75), breaks = seq(8.5,11,.5)) +
+  labs(x = "Log parent household wage",
+       y = "Mean log child household income",
+       title = "Intergenerational Elasticity") +
+  facet_wrap(vars(first_stage_lab_ordered), nrow = 1) +
+  theme(plot.title = element_text(size = 14, face = "italic"),
+        strip.text = element_text(face = "bold"),
+        text = element_text(size = text_size))
+graph_coef_ige
+
+
+# RRC graph
+figC2B <- fread(paste0(data_intergen, "figC2B_rank_cefs_instru_boot.csv")) %>%
+  mutate(instru = fct_recode(instru, "+ 2-digit occ." = "+ 2digit occ.", "+ city char." = "+ mun. char."),
+         first_stage_lab_ordered = fct_relevel(instru, "Education", "+ 2-digit occ.", "+ demographic char.", "+ city char."))
+
+rrc_labs <- figC2B %>% 
+  select(coef, boot_se, first_stage_lab_ordered) %>%
+  unique() %>% 
+  mutate(family_rank = 12,
+         child_rank = 73)
+
+graph_coef_rrc <- figC2B %>%
+  ggplot(aes(x = family_rank, y = child_rank)) +
+  geom_point(size = 3, alpha = alpha, color = my_palette[3]) +
+  geom_smooth(method = "lm", se = FALSE, formula = y ~ poly(x,3), color = my_palette[3]) +
+  geom_text(data = rrc_labs,
+            aes(label = paste0("RRC = ", round(coef, 2), " (", round(boot_se,3), ")")), hjust = 0, size = 5) +
+  scale_y_continuous(breaks = seq(35, 100, 10)) +
+  labs(x = "Parent household wage rank",
+       y = "Mean child household income rank",
+       title = "Rank-Rank Correlation") +
+  facet_wrap(vars(first_stage_lab_ordered), nrow = 1) +
+  theme(plot.title = element_text(size = 14, face = "italic"),
+        strip.text = element_text(face = "bold"),
+        text = element_text(size = text_size))
+graph_coef_rrc
+
+# Transition matrix graph
+matrix_robust_instruments <- fread(paste0(data_intergen, "figC2C_tms_instru_boot.csv")) %>%
+  mutate(instru = fct_recode(instru, "+ 2-digit occ." = "+ 2digit occ.", "+ city char." = "+ mun. char."),
+         first_stage_lab_ordered = fct_relevel(instru, "Education", "+ 2-digit occ.", "+ demographic char.", "+ city char."),
+         parent_qtile = factor(family_quintile, levels = 1:5, labels = c("Bottom\n20%", "2", "3", "4", "Top\n20%")),
+         child_qtile = factor(child_quintile, levels = 1:5, labels = c("Bottom 20%", "2", "3", "4", "Top 20%")),
+         lab = paste0(pct, "\n(", round(boot_se, 3), ")"))
+
+graph_matrix <- matrix_robust_instruments %>%
+  ggplot(aes(x = factor(parent_qtile), y = share, fill = forcats::fct_rev(factor(child_qtile)), label = lab)) +
+  geom_bar(stat = "identity", alpha = alpha) +
+  geom_text(size = 2.75, position = position_stack(vjust = 0.5), col = "white") +
+  facet_wrap(vars(first_stage_lab_ordered), nrow = 1) +
+  scale_y_continuous(breaks = seq(0,100,20), expand = c(0,0)) +
+  labs(
+    x = "Parent household wage quintile",
+    y = NULL,
+    fill = "Child income\nquintile:",
+    title = "Transition Matrix"
+  ) +
+  theme(text=element_text(size = text_size),
+        plot.title = element_text(size = 14, face = "italic"),
+        strip.text = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        legend.direction = "vertical",
+        legend.position = "right",
+        legend.key = element_rect(size = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(1, "cm"),
+        legend.key.width = unit(.5, "cm"),
+        axis.text.x = element_text(size = 11),
+        legend.text = element_text(size = 11),
+        legend.title = element_text(size = 12, face = "italic"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid.major = element_blank()) +
+  scale_fill_manual(values = my_palette[c(5,4,3,2,1)])
+graph_matrix
+
+robust_instruments_se <- fread(paste0(data_intergen, "figC2D_FS_R2.csv")) %>%
+  mutate(instru = fct_recode(instru, "+ 2-digit occ." = "+ 2digit occ.", "+ city char." = "+ mun. char."),
+         first_stage_lab_ordered = fct_relevel(instru, "Education", "+ 2-digit occ.", "+ demographic char.", "+ city char."),
+         parent = factor(parent, levels = c("father_R2.Figure", "mother_R2.Figure"), labels = c("Synthetic Fathers", "Synthetic Mothers"))) %>% select(-n) %>%  unique()
+graph_r2 <- robust_instruments_se %>%
+  ggplot(aes(x = first_stage_lab_ordered, y = R2, fill = parent)) +
+  geom_col(position = position_dodge2(.5)) +
+  scale_y_continuous(lim = c(0,.5), breaks = seq(0,.5,.25), expand = c(0,0)) +
+  scale_fill_manual(values = alpha(my_palette[c(4,2)], alpha), guide = guide_legend(nrow = 1), labels = c("Synthetic Fathers", "Synthetic Mothers")) +
+  labs(x = NULL, y = NULL, title = "First-Stage Model R2", fill = NULL) +
+  theme(legend.position = c(0.01,1.1),
+        legend.justification = c(0,1),
+        panel.grid.major.x = element_blank(),
+        axis.text.x = element_text(size = 16),
+        plot.title = element_text(size = 10, face = "italic"),
+        legend.background = element_blank())
+graph_r2
+
+plot_grid(graph_coef_ige,
+          graph_coef_rrc,
+          graph_matrix,
+          graph_r2,
+          # graph_pred,
+          ncol = 1, align = "v", axis = "l", rel_heights = c(.7,.7,.7,.35))
+
+ggsave(paste0(fig_final_path, "appendix C/figC2_robust_instruments_onlyr2.pdf"), height = 14, width = (16 * 6 )/9)
+# ----
+```
+
+### Fig C3. Robustness to Machine Learning Prediction
+
+```{r}
+figC3A <- fread(paste0(data_intergen, "figC3A_machine_learning.csv")) %>%
+  mutate(estimator = factor(estimator, levels = c("IGE", "RRC", "bot_bot", "bot_top"),
+                            labels = c("IGE", "RRC", "P(Bot. 20% | Bot. 20%)", "P(Top 20% | Bot. 20%)")),
+         label_clean = case_when(estimator %in% c("IGE", "RRC") ~ as.character(round(coef, 2)),
+                                 !estimator %in% c("IGE", "RRC") ~ paste0(round(coef*100, 2), "%")),
+         method = fct_relevel(method, "Baseline", "GAM", "Boosted tree", "Ensemble method"))
+
+barplot <-  figC3A %>%
+  ggplot(aes(fill = estimator, y = coef, x = method)) + 
+  geom_bar(position = "dodge2", stat = "identity", alpha = alpha) +
+  scale_fill_manual(values = alpha(my_palette[c(5,4,2,1)], alpha)) +
+  scale_y_continuous(limits = c(0, .6), breaks = seq(0, .6, .1), expand = c(0,0)) +
+  labs(fill = NULL, y = NULL) +
+  geom_text(aes(label = label_clean), position = position_dodge(width = 0.9), vjust = -.5) +
+  theme(legend.position = c(0.01,0.99),
+        legend.justification = c(0,1),
+        legend.direction = "horizontal", 
+        axis.title.x = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        strip.placement = "outside",
+        strip.text.y = element_text(face = "bold", size = 14),
+        panel.spacing.y = unit(0.3, "cm"),
+        strip.text.x = element_text(face = "bold"),
+        text = element_text(size = 16),
+        panel.spacing = unit(3, "lines"))
+barplot
+
+figC3B <- fread(paste0(data_intergen, "figC3B_machine_learning_mse.csv")) %>%
+  mutate(group = case_when(group == "Males" ~ "Synthetic fathers",
+                           group == "Female" ~ "Synthetic mothers",
+                           TRUE ~ group),
+         method = fct_relevel(method, "Baseline", "GAM", "Boosted tree", "Ensemble method"))
+mse_plot <- figC3B %>%
+  mutate(Sample = fct_relevel(group, "Synthetic mothers", "Synthetic fathers")) %>%
+  ggplot(aes(group = group, color = group, y = mse, x = method)) + 
+  geom_line(alpha = .75) + geom_point(show.legend = FALSE, alpha = .75) + 
+  scale_color_manual(values = alpha(my_palette[c(2,4)], alpha)) +
+  labs(color = NULL, x = NULL) +
+  scale_y_continuous(lim = c(0,.75), breaks = seq(0,1,.25), name = "MSE", expand = c(0,0)) +
+  theme(legend.position = c(0.01,0.975),
+        legend.justification = c(0,1),
+        legend.direction = "horizontal",
+        legend.background = element_blank(),
+        text = element_text(size = text_size))
+mse_plot
+
+plot_grid(barplot, mse_plot, ncol = 1, align = "v", axis = "l",rel_heights = c(1,.3))
+ggsave(paste0(fig_final_path, "appendix C/figC3_ml_methods.pdf"), height = figure_height, width = figure_width)
+```
+
+### Fig C4. Child Lifecycle Bias - 1972 and 1974 Cohorts (Constant Sample)
+
+```{r}
+figC4 <- fread(paste0(data_intergen, "figC4_child_lifecycle_constant_boot.csv"))
+
+# IGE Child Lifecycle bias - Labor income 1972 & 1974 ----
+ige_childlifecycle_labinc_graph <- figC4 %>% 
+  filter(estimate == "IGE") %>%
+  ggplot(aes(x = age, y = coef, linetype = factor(sample))) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), alpha = 0.2, show.legend = F) +
+  geom_point(size = 1, color = alpha(my_palette[3], alpha)) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(breaks = seq(0,.5,.1)) +
+  coord_cartesian(ylim = c(-0.02, .425)) +
+  scale_x_continuous(breaks = seq(25,43,3)) +
+  scale_linetype_discrete(labels = c("1972", "1974")) +
+  labs(x = NULL,
+       y = NULL,
+       linetype = NULL,
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_childlifecycle_labinc_graph
+# ----
+
+# RRC Child Lifecycle bias - Labor income 1972 & 1974 ----
+rrc_childlifecycle_labinc_graph <- figC4 %>%
+  filter(estimate == "RRC") %>%
+  ggplot(aes(x = age, y = coef, linetype = factor(sample))) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), alpha = 0.2, show.legend = F) +
+  geom_point(size = 1, color = alpha(my_palette[3], alpha)) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(breaks = seq(0,.3,.1)) +
+  coord_cartesian(ylim = c(0, .32),) +
+  scale_x_continuous(breaks = seq(25,43,3)) +
+  scale_linetype_discrete(labels = c("1972", "1974")) +
+  labs(x = "Child age",
+       y = NULL,
+       linetype = NULL,
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_childlifecycle_labinc_graph
+# ----
+
+# Transition matrix Child Lifecycle bias - Labor income 1972 & 1974 ----
+figC4 <- figC4 %>%
+  mutate(group = factor(group, levels = c("Bot->Bot", "Bot->Top", "Top->Bot", "Top->Top"), labels = c("Bot. 20% to Bot. 20%", "Bot. 20% to Top 20%", "Top 20% to Bot. 20%", "Top 20% to Top 20%"))) %>% setDT()
+dt_text <- figC4 %>%
+  filter(estimate == "TM" & age == 25 & sample == 1972) %>% setDT()
+
+matrix_childlifecycle_labinc_graph <- figC4 %>%
+  filter(estimate == "TM") %>%
+  ggplot(aes(x = age, y = coef, linetype = factor(sample), col = factor(group))) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se, fill = factor(group)), color = NA, show.legend = F) +
+  geom_point(size = 1, show.legend = FALSE) +
+  geom_line(show.legend = FALSE) +
+  geom_text(data = dt_text[group == "Bot. 20% to Bot. 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = .03, nudge_x = 3) +
+  geom_text(data = dt_text[group == "Bot. 20% to Top 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = -.06) +
+  geom_text(data = dt_text[group == "Top 20% to Bot. 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = -.08, nudge_x = 4) +
+  geom_text(data = dt_text[group == "Top 20% to Top 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = .08, nudge_x = 3) +
+  scale_x_continuous(breaks = seq(25,43,3)) +
+  scale_y_continuous(lim = c(0,.435), labels = scales::percent_format(1)) +
+  scale_color_manual(values = alpha(my_palette[c(1,2,4,5)], alpha)) +
+  scale_fill_manual(values = alpha(my_palette[c(1,2,4,5)], .2)) +
+  scale_linetype_discrete(labels = c("1972", "1974")) +
+  labs(x = NULL,
+       y = NULL,
+       col = NULL,
+       linetype = NULL,
+       title = "Transition Matrix") +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic")) +
+  guides(color = FALSE)
+matrix_childlifecycle_labinc_graph
+# ----
+
+# All together Child Lifecycle bias - Labor income 1972 & 1974 ----
+patchwork <- ige_childlifecycle_labinc_graph + rrc_childlifecycle_labinc_graph + matrix_childlifecycle_labinc_graph
+patchwork + plot_annotation(tag_levels = "A") + plot_layout(guides = "collect") & theme(legend.position = "top")
+ggsave(paste0(fig_final_path, "appendix C/figC4_all_childlifecycle_netnetr_1972_74.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+### Fig C5. Child and Parent Lifecycle Bias
+
+```{r}
+# IGE
+ige3D <- read.csv(paste0(data_intergen, "figC5A_IGE_joint_lifetime_income.csv"))
+
+ige3D <- ige3D %>%
+  select(parents_age, child_age, coef) %>%
+  arrange(parents_age, child_age) %>%
+  pivot_wider(names_from = "parents_age", values_from = "coef") %>%
+  as.matrix()
+rownames(ige3D) <- ige3D[, 1]
+IGE <- ige3D[, 2:ncol(ige3D)]
+
+plot_ly(x = ~ -as.numeric(colnames(IGE)), y = ~ -as.numeric(rownames(IGE)), z=~IGE, type = "surface", 
+        colors = colorRamp(scico(10, palette = 'lajolla')[1:10])) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Parent age", ticketmode = 'array', 
+                   ticktext = as.character(seq(25, 60, 5)), 
+                   tickvals = -seq(25, 60, 5)),
+      yaxis = list(title = "Child age", ticketmode = 'array', 
+                   ticktext = as.character(seq(30, 44, 2)), 
+                   tickvals = -seq(30, 44, 2)),
+      zaxis = list(title = "IGE", range = c(0, .6), tickvals = seq(.1, .6, .1)),
+      camera = list(eye = list(x = 1, y = 2.5, z = 1))
+    )
+  )
+
+
+# RRC
+rrc3D <- read.csv(paste0(data_intergen, "figC5B_RRC_joint_lifetime_income.csv"))
+
+rrc3D <- rrc3D %>%
+  select(parents_age, child_age, coef) %>%
+  arrange(parents_age, child_age) %>%
+  pivot_wider(names_from = "parents_age", values_from = "coef") %>%
+  as.matrix()
+rownames(rrc3D) <- rrc3D[, 1]
+RRC <- rrc3D[, 2:ncol(rrc3D)]
+
+plot_ly(x = ~ -as.numeric(colnames(RRC)), y = ~ -as.numeric(rownames(RRC)), z=~RRC, type = "surface", 
+        colors = colorRamp(scico(10, palette = 'lajolla')[1:10])) %>%
+  layout(
+    scene = list(
+      xaxis = list(title = "Parent age", ticketmode = 'array', 
+                   ticktext = as.character(seq(25, 60, 5)), 
+                   tickvals = -seq(25, 60, 5)),
+      yaxis = list(title = "Child age", ticketmode = 'array', 
+                   ticktext = as.character(seq(30, 44, 2)), 
+                   tickvals = -seq(30, 44, 2)),
+      zaxis = list(title = "RRC", range = c(0, .4), tickvals = seq(.1, .4, .1)),
+      camera = list(eye = list(x = 1, y = 2.5, z = 1))
+    )
+  )
+```
+
+### Fig C6. Attenuation Bias
+
+```{r}
+figc6 <- fread(paste0(data_intergen, "figC6_parents_attenuation_boot.csv"))
+
+# Bsaeline IGE Parent Attenuation bias - actual number of observations ----
+ige_parentattenuation_actualnobs_graph <- figc6 %>%
+  filter(estimate == "IGE") %>%
+  ggplot(aes(x = nobs, y = coef, linetype = parent_var)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .8), breaks = seq(0,.8,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,11), breaks = seq(1,11,2)) +
+  scale_linetype_discrete(labels = c("Parent household wage", "Father wage")) +
+  labs(x = NULL,
+       y = NULL,
+       linetype = "Parent income definition:",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_parentattenuation_actualnobs_graph
+# ----
+
+# RRC Parent Attenuation bias - actual number of observations ----
+rrc_parentattenuation_actualnobs_graph <- figc6 %>%
+  filter(estimate == "RRC") %>%
+  ggplot(aes(x = nobs, y = coef, linetype = parent_var)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .4), breaks = seq(0,.4,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,11), breaks = seq(1,11,2)) +
+  scale_linetype_discrete(labels = c("Parent household wage", "Father wage")) +
+  labs(x = "Number of (synthetic) parent\nincome observations (centered at 40)",
+       y = NULL,
+       linetype = "Parent income definition:",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        axis.title.x = element_text(size = 13),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_parentattenuation_actualnobs_graph
+# ----
+
+# P(5,5) and P(1,5) Parent Attenuation bias - actual number of observations ----
+figc6 <- figc6 %>%
+  mutate(group = factor(group, levels = c("Bot->Bot", "Bot->Top", "Top->Bot", "Top->Top"), labels = c("Bot. 20% to Bot. 20%", "Bot. 20% to Top 20%", "Top 20% to Bot. 20%", "Top 20% to Top 20%"))) %>% setDT()
+dt_text <- figc6 %>%
+  filter(estimate == "TM" & nobs == 2 & parent_var == "family")
+
+matrix_parentattenuation_actualnobs_graph <- figc6 %>%
+  filter(estimate == "TM") %>%
+  ggplot(aes(x = nobs, y = coef, linetype = parent_var, col = factor(group))) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se, fill = factor(group)), color = NA, show.legend = F) +
+  geom_point(show.legend = FALSE) +
+  geom_line(show.legend = FALSE) +
+  geom_text(data = dt_text[group == "Bot. 20% to Bot. 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = -.045) +
+  geom_text(data = dt_text[group == "Bot. 20% to Top 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = -.02) +
+  geom_text(data = dt_text[group == "Top 20% to Bot. 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = .025) +
+  geom_text(data = dt_text[group == "Top 20% to Top 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = .025) +
+  scale_x_continuous(lim = c(1,11), breaks = seq(1,11,2)) +
+  scale_y_continuous(lim = c(0,.42), labels = scales::percent_format(1), expand = c(0,0)) +
+  scale_linetype_discrete(labels = c("Parent household wage", "Father wage")) +
+  scale_colour_manual(values = alpha(my_palette[c(1,2,4,5)], alpha)) +
+  scale_fill_manual(values = alpha(my_palette[c(1,2,4,5)], .2)) +
+  labs(x = NULL,
+       y = NULL,
+       col = NULL,
+       linetype = "Parent income definition:",
+       title = "Transition Matrix") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic")) +
+  guides(col = FALSE)
+matrix_parentattenuation_actualnobs_graph
+# ----
+
+# All together Parent Attenuation bias - actual number of observations ----
+patchwork <- ige_parentattenuation_actualnobs_graph + rrc_parentattenuation_actualnobs_graph + matrix_parentattenuation_actualnobs_graph
+patchwork + plot_annotation(tag_levels = "A") + plot_layout(guides = "collect") & theme(legend.position = "top")
+ggsave(paste0(fig_final_path, "appendix C/figC6_all_parentattenuation_actualnobs_withfather.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+### Fig C7. Parent Attenuation Bias (Constant Sample of Synthetic Parents)
+
+```{r}
+figC7 <- fread(paste0(data_intergen, "figC7_parents_attenuation_constant_boot.csv"))
+
+# Bsaeline IGE Parent Attenuation bias - actual number of observations ----
+ige_parentattenuation_actualnobs_graph <- figC7 %>% 
+  filter(estimate == "IGE") %>% 
+  ggplot(aes(x = nobs, y = coef, linetype = parent_var)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .8), breaks = seq(0,.8,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,11), breaks = seq(1,11,2)) +
+  scale_linetype_discrete(labels = c("Parent household wage", "Father wage")) +
+  labs(x = NULL,
+       y = NULL,
+       linetype = "Parent income definition:",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_parentattenuation_actualnobs_graph
+# ----
+
+# RRC Parent Attenuation bias - actual number of observations ----
+rrc_parentattenuation_actualnobs_graph <- figC7 %>%
+  filter(estimate == "RRC")  %>%
+  ggplot(aes(x = nobs, y = coef, linetype = parent_var)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .4), breaks = seq(0,.4,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,11), breaks = seq(1,11,2)) +
+  scale_linetype_discrete(labels = c("Parent household wage", "Father wage")) +
+  labs(x = "Number of (synthetic) parent\nincome observations (centered at 40)",
+       y = NULL,
+       linetype = "Parent income definition:",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        axis.title.x = element_text(size = 13),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_parentattenuation_actualnobs_graph
+# ----
+
+# P(5,5) and P(1,5) Parent Attenuation bias - actual number of observations ----
+figC7 <- figC7 %>%
+  mutate(group = factor(group, levels = c("Bot->Bot", "Bot->Top", "Top->Bot", "Top->Top"), labels = c("Bot. 20% to Bot. 20%", "Bot. 20% to Top 20%", "Top 20% to Bot. 20%", "Top 20% to Top 20%"))) %>% setDT()
+dt_text <- figC7 %>%
+  filter(estimate == "TM" & nobs == 2 & parent_var == "family")
+
+matrix_parentattenuation_actualnobs_graph <- figC7 %>%
+  filter(estimate == "TM") %>%
+  ggplot(aes(x = nobs, y = coef, linetype = parent_var, col = factor(group))) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se, fill = factor(group)), color = NA, show.legend = F) +
+  geom_point(show.legend = FALSE) +
+  geom_line(show.legend = FALSE) +
+  geom_text(data = dt_text[group == "Bot. 20% to Bot. 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = -.045) +
+  geom_text(data = dt_text[group == "Bot. 20% to Top 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = -.02) +
+  geom_text(data = dt_text[group == "Top 20% to Bot. 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = .025) +
+  geom_text(data = dt_text[group == "Top 20% to Top 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = .025) +
+  scale_x_continuous(lim = c(1,11), breaks = seq(1,11,2)) +
+  scale_y_continuous(lim = c(0,.42), labels = scales::percent_format(1), expand = c(0,0)) +
+  scale_linetype_discrete(labels = c("Parent household wage", "Father wage")) +
+  scale_colour_manual(values = alpha(my_palette[c(1,2,4,5)], alpha)) +
+  scale_fill_manual(values = alpha(my_palette[c(1,2,4,5)], .2)) +
+  labs(x = NULL,
+       y = NULL,
+       col = NULL,
+       linetype = "Parent income definition:",
+       title = "Transition Matrix") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic")) +
+  guides(col = FALSE)
+matrix_parentattenuation_actualnobs_graph
+# ----
+
+# All together Parent Attenuation bias - actual number of observations ----
+patchwork <- ige_parentattenuation_actualnobs_graph + rrc_parentattenuation_actualnobs_graph + matrix_parentattenuation_actualnobs_graph
+patchwork + plot_annotation(tag_levels = "A") + plot_layout(guides = "collect") & theme(legend.position = "top")
+ggsave(paste0(fig_final_path, "appendix C/figC7_all_parentattenuation_actualnobs_samesample_withfather.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+### Fig C8. Sensitivity to Number of Child Income Observations (Constant Sample)
+
+```{r}
+figC8 <- fread(paste0(data_intergen, "figC8_child_n_inc_observations_boot.csv"))
+
+# IGE Child Attenuation bias - same sample ----
+ige_childattenuation_samesample_graph <- figC8 %>%
+  filter(estimate == "IGE") %>%
+  ggplot(aes(x = n_obs, y = coef)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .7), breaks = seq(0,.7,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,7), breaks = seq(1,7,2)) +
+  labs(x = NULL,
+       y = NULL,
+       title = "Intergenerational Elasticity") +
+  theme(text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_childattenuation_samesample_graph
+# ----
+
+# RRC Child Attenuation bias - same sample ----
+rrc_childattenuation_samesample_graph <- figC8 %>%
+  filter(estimate == "RRC") %>%
+  ggplot(aes(x = n_obs, y = coef)) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se), alpha = 0.2, show.legend = F) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .4), breaks = seq(0,.4,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,7), breaks = seq(1,7,2)) +
+  labs(x = "Number of child income observations\n(centered in 2013)",
+       y = NULL,
+       title = "Rank-Rank Correlation") +
+  theme(text=element_text(size = 16),
+        axis.title.x = element_text(size = 13),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_childattenuation_samesample_graph
+# ----
+
+# P(5,5) and P(1,5) Parent Attenuation bias - same sample ----
+figC8 <- figC8 %>%
+  mutate(group = factor(group, levels = c("Bot->Bot", "Bot->Top", "Top->Bot", "Top->Top"), labels = c("Bot. 20% to Bot. 20%", "Bot. 20% to Top 20%", "Top 20% to Bot. 20%", "Top 20% to Top 20%"))) %>% setDT()
+dt_text <- figC8 %>%
+  filter(estimate == "TM" & n_obs == 1)
+
+matrix_childattenuation_samesample_graph <- figC8 %>%
+  filter(estimate == "TM") %>%
+  ggplot(aes(x = n_obs, y = coef, col = factor(group))) +
+  geom_ribbon(aes(ymin = coef - 1.96*boot_se, ymax = coef + 1.96*boot_se, fill = factor(group)), color = NA, alpha = 0.2, show.legend = F) +
+  geom_point() +
+  geom_line() +
+  geom_text(data = dt_text[group == "Bot. 20% to Bot. 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = -.02) +
+  geom_text(data = dt_text[group == "Bot. 20% to Top 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = -.02) +
+  geom_text(data = dt_text[group == "Top 20% to Bot. 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = .02) +
+  geom_text(data = dt_text[group == "Top 20% to Top 20%"], aes(y = coef, label = group), hjust = 0, nudge_y = .02) +
+  scale_x_continuous(lim = c(1,7), breaks = seq(1,7,2)) +
+  scale_y_continuous(lim = c(0,.42), labels = scales::percent_format(1), expand = c(0,0)) +
+  scale_colour_manual(values = alpha(my_palette[c(1,2,4,5)], alpha)) +
+  scale_fill_manual(values = alpha(my_palette[c(1,2,4,5)], .2)) +
+  labs(x = NULL,
+       y = NULL,
+       col = NULL,
+       title = "Transition Matrix") +
+  theme(legend.position = "none",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+matrix_childattenuation_samesample_graph
+# ----
+
+# All together Parent Attenuation bias - same sample ----
+patchwork <- ige_childattenuation_samesample_graph + rrc_childattenuation_samesample_graph + matrix_childattenuation_samesample_graph
+patchwork + plot_annotation(tag_levels = "A")
+ggsave(paste0(fig_final_path, "appendix C/figC8_all_childattenuation_samesample.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+### Fig C9. Sensitivity to Different Zero Child Income Replacement Values
+
+```{r}
+euro <- dollar_format(prefix = "", suffix = "\u20ac", big.mark = ",")
+
+figC9 <- fread(paste0(data_intergen, "figC9_0_replacement_boot.csv")) %>%
+  mutate(sample = case_when(subsample == "FM" ~ "All",
+                            subsample == "M" ~ "Sons",
+                            subsample == "F" ~ "Daughters"),
+         sample = fct_relevel(sample, "All", "Sons", "Daughters"),
+         child_inc_var = factor(child_var, levels = c("household_income", "individual_income", "labor_income"), labels = c("Household income", "Individual income", "Individual wage")),
+         replace_0_lab = case_when(replace0 == 0 ~ "Drop",
+                                   replace0 == 1 ~ "1",
+                                   replace0 == 1000 ~ "1,000"),
+         replace_0_lab = forcats::fct_relevel(replace_0_lab, "Drop", "1", "1,000"))
+
+# IGE Replacing 0s by 1 or 1,000 euros ----
+ige_replace0s <- figC9 %>% filter(estimator == "IGE")
+
+ige_replace0s_graph <- ige_replace0s %>%
+  mutate(lab = ifelse(substr(as.character(coef),1,1) == 0, substr(as.character(round(coef, 2)),2,4), substr(as.character(round(coef, 2)),1,3))) %>%
+  ggplot(aes(x = sample, y = coef, fill = replace_0_lab)) +
+  geom_bar(stat = "identity", position = position_dodge(width = .75), width = .4, alpha = alpha) +
+  geom_errorbar(aes(ymin = boot_lb, ymax = boot_ub), position = position_dodge(width = .75), color = "black", width = .1) +
+  geom_text(aes(y = ub + 0.04, label = lab, color = replace_0_lab), position = position_dodge(width = .75), show.legend = FALSE, size = 5) +
+  scale_fill_manual(values = alpha(my_palette[c(3,1,5)], alpha)) +
+  scale_color_manual(values = alpha(my_palette[c(3,1,5)], alpha)) +
+  facet_grid(cols = vars(child_inc_var)) +
+  scale_y_continuous(limits = c(0, 1.2), breaks = seq(0,1.2,.2), expand = c(0,0)) +
+  labs(x = NULL,
+       y = NULL,
+       fill = "Replacement value for 0s",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = c(0.01,0.98),
+        legend.justification = c(0,1),
+        legend.title = element_text(size=12, face = "italic"),
+        plot.caption = element_text(size = 10),
+        plot.title = element_text(size = 14, face = "italic"),
+        text=element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        panel.grid.major.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 1))
+ige_replace0s_graph
+# ----
+
+# RRC Replacing 0s by 1 or 1,000 euros ----
+rrc_replace0s <- figC9 %>% filter(estimator == "RRC")
+
+rrc_replace0s_graph <- rrc_replace0s %>%
+  mutate(lab = ifelse(substr(as.character(coef),1,1) == 0, substr(as.character(round(coef, 2)),2,4), substr(as.character(round(coef, 2)),1,3))) %>%
+  ggplot(aes(x = sample, y = coef, fill = replace_0_lab)) +
+  geom_bar(stat="identity", position = position_dodge(width = .75), width = .4, alpha = alpha) +
+  geom_errorbar(aes(ymin = boot_lb, ymax = boot_ub), position = position_dodge(width = .75), color = "black", width = .1) +
+  geom_text(aes(y = ub + 0.04, label = lab, color = replace_0_lab), position = position_dodge(width = .75), show.legend = FALSE, size = 5) +
+  scale_fill_manual(values = alpha(my_palette[c(3,1,5)], alpha)) +
+  scale_color_manual(values = alpha(my_palette[c(3,1,5)], alpha)) +
+  facet_grid(cols = vars(child_inc_var)) +
+  scale_y_continuous(limits = c(0, .5), expand = c(0,0)) +
+  labs(x = NULL,
+       y = NULL,
+       fill = "Replacement value for 0s",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = c(0.01,0.98),
+        legend.justification = c(0,1),
+        legend.title = element_text(size=12, face = "italic"),
+        plot.caption = element_text(size = 10),
+        plot.title = element_text(size = 14, face = "italic"),
+        text=element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        panel.grid.major.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 1))
+rrc_replace0s_graph
+# ----
+
+# All together Replacing 0s ----
+patchwork <- ige_replace0s_graph / rrc_replace0s_graph
+patchwork + plot_annotation(tag_levels = "A")
+ggsave(paste0(fig_final_path, "appendix C/figC9_all_replace0s.pdf"), height = 10, width = 10)
+# ----
+```
+
+### Fig C10. Sensitivity to Child and Parent Income Distributions Trimming
+
+```{r}
+figC10 <- fread(paste0(data_intergen, "figC10_trimming.csv")) |> 
+  mutate(trim_bot_lab = factor(bot, levels = c(seq(0, .05, .01), .1), labels = c("None", "1%", "2%", "3%", "4%", "5%", "10%")),
+         trim_bot_lab = fct_relevel(trim_bot_lab, "None", "1%", "2%", "3%", "4%", "5%", "10%"),
+         trim_top_lab = factor(top, levels = c(seq(0, .05, .01), .1), labels = c("None", "1%", "2%", "3%", "4%", "5%", "10%")),
+         trim_top_lab = fct_relevel(trim_top_lab, "None", "1%", "2%", "3%", "4%", "5%", "10%"))
+
+# IGE Trimming Children ----
+baseline = figC10 |> 
+  filter(trim == "Children" & estimate == "IGE" & trim_top_lab == "None" & trim_bot_lab == "None")
+
+ige_childtrim_graph <- figC10 |> 
+  filter(trim == "Children" & estimate == "IGE") %>%
+  ggplot(aes(x = trim_bot_lab, y = trim_top_lab, fill = coef)) +
+  geom_tile() +
+  geom_text(aes(label = round(coef,3)), color = "#444444") +
+  scale_fill_scico(palette = "lajolla", limits = c(baseline$coef / 3, baseline$coef * 1.6)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  labs(x = "Bottom trimming",
+       y = "Top trimming",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "none",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_childtrim_graph
+# ----
+
+# RRC Trimming Children ----
+baseline = figC10 |> 
+  filter(trim == "Children" & estimate == "RRC" & trim_top_lab == "None" & trim_bot_lab == "None")
+
+rrc_childtrim_graph <- figC10 |> 
+  filter(trim == "Children" & estimate == "RRC") %>%
+  ggplot(aes(x = trim_bot_lab, y = trim_top_lab, fill = coef)) +
+  geom_tile() +
+  geom_text(aes(label = round(coef,3)), color = "#444444") +
+  scale_fill_scico(palette = "lajolla", limits = c(baseline$coef / 3, baseline$coef * 1.6)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  labs(x = "Bottom trimming",
+       y = "Top trimming",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "none",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_childtrim_graph
+# ----
+
+# All together Trimming Children ----
+patchwork <- ige_childtrim_graph + rrc_childtrim_graph
+patchwork + plot_annotation(tag_levels = "A")
+ggsave(paste0(fig_final_path, "appendix C/figC10A_all_childtrim.pdf"), height = figure_height, width = figure_width)
+# ----
+
+
+# IGE Trimming FS Parent ----
+baseline = figC10 |> 
+  filter(trim == "First stage" & estimate == "IGE" & trim_top_lab == "None" & trim_bot_lab == "None")
+
+ige_parenttrim_fs_graph <- figC10 |> 
+  filter(trim == "First stage" & estimate == "IGE") |> 
+  ggplot(aes(x = trim_bot_lab, y = trim_top_lab, fill = coef)) +
+  geom_tile() +
+  geom_text(aes(label = round(coef,3)), color = "white") +
+  scale_fill_scico(palette = "lajolla", limits = c(baseline$coef / 3, baseline$coef * 1.6)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  labs(x = "Bottom trimming",
+       y = "Top trimming",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "none",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_parenttrim_fs_graph
+# ----
+
+# RRC Trimming FS Parent ----
+baseline = figC10 |> 
+  filter(trim == "First stage" & estimate == "RRC" & trim_top_lab == "None" & trim_bot_lab == "None")
+
+rrc_parenttrim_fs_graph <- figC10 |> 
+  filter(trim == "First stage" & estimate == "RRC") |> 
+  ggplot(aes(x = trim_bot_lab, y = trim_top_lab, fill = coef)) +
+  geom_tile() +
+  geom_text(aes(label = round(coef,3)), color = "white") +
+  scale_fill_scico(palette = "lajolla", limits = c(baseline$coef / 3, baseline$coef * 1.6)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  labs(x = "Bottom trimming",
+       y = "Top trimming",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "none",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_parenttrim_fs_graph
+# ----
+
+# All together Trimming FS Parent ----
+patchwork <- ige_parenttrim_fs_graph + rrc_parenttrim_fs_graph
+patchwork + plot_annotation(tag_levels = "A")
+ggsave(paste0(fig_final_path, "appendix C/figC10B_all_parenttrim_fs.pdf"), height = figure_height, width = figure_width)
+# ----
+
+
+# IGE Trimming SS Parent ----
+baseline = figC10 |> 
+  filter(trim == "Second stage" & estimate == "IGE" & trim_top_lab == "None" & trim_bot_lab == "None")
+
+ige_parenttrim_ss_graph <- figC10 |> 
+  filter(trim == "Second stage" & estimate == "IGE") |> 
+  ggplot(aes(x = trim_bot_lab, y = trim_top_lab, fill = coef)) +
+  geom_tile() +
+  geom_text(aes(label = round(coef,3)), color = "white") +
+  scale_fill_scico(palette = "lajolla", limits = c(baseline$coef / 3, baseline$coef * 1.6)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  labs(x = "Bottom trimming",
+       y = "Top trimming",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "none",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_parenttrim_ss_graph
+# ----
+
+# RRC Trimming SS Parent ----
+baseline = figC10 |> 
+  filter(trim == "Second stage" & estimate == "RRC" & trim_top_lab == "None" & trim_bot_lab == "None")
+
+rrc_parenttrim_ss_graph <- figC10 |> 
+  filter(trim == "Second stage" & estimate == "RRC") |> 
+  ggplot(aes(x = trim_bot_lab, y = trim_top_lab, fill = coef)) +
+  geom_tile() +
+  geom_text(aes(label = round(coef,3)), color = "white") +
+  scale_fill_scico(palette = "lajolla", limits = c(baseline$coef / 3, baseline$coef * 1.6)) +
+  scale_x_discrete(expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  labs(x = "Bottom trimming",
+       y = "Top trimming",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "none",
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+rrc_parenttrim_ss_graph
+# ----
+
+# All together Trimming FS Parent ----
+patchwork <- ige_parenttrim_ss_graph + rrc_parenttrim_ss_graph
+patchwork + plot_annotation(tag_levels = "A")
+ggsave(paste0(fig_final_path, "appendix C/figC10C_all_parenttrim_ss.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+### Fig C11. Out-of-sample MSE as a Function of Top and Bottom Trimming
+
+```{r}
+figC11 <- fread(paste0(data_intergen, "figC11_MSE_trimming.csv"))
+
+figC11 %>%
+  mutate(Gender = case_when(gender == "female" ~ "Synthetic mothers",
+                            gender == "male" ~ "Synthetic fathers")) %>%
+  ggplot(aes(x = trim, y = MSE, color = tail, fill = tail)) +
+  geom_point(alpha = alpha, show.legend = F) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 4), alpha = alpha, size = 1, se = F, show.legend = F) +
+  geom_point(size = 0, shape = 22, alpha = alpha) +
+  facet_wrap(~ Gender, nrow = 2, scales = "free_y", strip.position = "left") +
+  ylab("Out-of-sample MSE") + xlab("% trimmed") +
+  guides(color = guide_legend(override.aes = list(size = 10))) +
+  scale_color_manual(values = alpha(my_palette[c(2,4)], alpha), name = "Tail trimmed:") +
+  scale_fill_manual(values = alpha(my_palette[c(2,4)], alpha), name = "Tail trimmed:") +
+  theme(strip.placement = "outside",
+        strip.text.y = element_text(face = "bold", size = 14),
+        panel.spacing.y = unit(1, "cm"),
+        strip.text.x = element_text(face = "bold"),
+        text = element_text(size = text_size),
+        panel.spacing = unit(3, "lines"),
+        legend.position = c(0.01,.99), 
+        legend.justification = c(0,1),
+        legend.title = element_text(size=12, face = "italic"),
+        legend.direction = "horizontal")
+ggsave(paste0(fig_final_path, "appendix C/figC11_mse_trim.pdf"), height = figure_height, width = figure_width)
+```
+
+### Fig C12. Top Parent Income Quantiles Transition Matrices in France and United States
+
+```{r}
+# Detailed transition matrix - Comparison with US ----
+tm_top_fr <- fread(paste0(data_intergen, "figC12_top_tm_boot.csv"))
+
+reduce_matrix <- function(quant = 5, ready_to_plot = F) {
+  reduced_matrix <- read_excel(here("figures/other_data/chetty_et_al_2014_qje/online_data_tables.xlsx"), 
+                             sheet = "Online Data Table 1", skip = 9, col_names = F) %>% 
+    select(-`...1`) %>% t()
+  colnames(reduced_matrix) <- paste0("child_q", c(paste0(0, 5:9), 10:99, 999))
+  reduced_matrix <- as_tibble(reduced_matrix) %>%
+    mutate(child_q01 = 0, child_q02 = 0, child_q03 = 0, child_q04 = 0) %>% 
+    select(sort(names(.))) %>%
+    rename(child_q100 = child_q999) %>%
+    mutate(parent_quantile = ceiling(quant  * (row_number() / 100))) %>%
+    group_by(parent_quantile) %>%
+    summarise_all(sum) %>%
+    select(-parent_quantile)
+  reduced_matrix <- t((quant/100)*reduced_matrix)
+  reduced_matrix <- as_tibble(reduced_matrix) %>%
+    mutate(child_quantile = ceiling(quant  * (row_number() / 100))) %>%
+    group_by(child_quantile) %>%
+    summarise_all(sum) %>%
+    select(-child_quantile) %>%
+    t()
+  colnames(reduced_matrix) <- paste(1:quant)
+  if (ready_to_plot == T) {
+    return(as_tibble(reduced_matrix) %>%
+             mutate(family_quantile = row_number()) %>%
+             pivot_longer(!family_quantile, names_to = "child_quantile", values_to = "share"))
+  } else {
+    return(reduced_matrix)
+  }
+  # Warning: For quantiles smaller than deciles, first quantiles will be incorrect due to
+  # grouping of negative/zero income earners.
+}
+
+tm_top_us <- rbind(reduce_matrix(quant = 10, ready_to_plot = T) %>%
+                     filter(family_quantile == max(family_quantile)) %>%
+                     mutate(Label = "D10"),
+                   reduce_matrix(quant = 20, ready_to_plot = T) %>%
+                     filter(family_quantile == max(family_quantile)) %>%
+                     mutate(Label = "V20"),
+                   reduce_matrix(quant = 50, ready_to_plot = T) %>%
+                     filter(family_quantile == max(family_quantile)) %>%
+                     mutate(Label = "C50"))
+
+# Combine FR and US data
+tm_top_fr_us <- rbind(tm_top_fr %>%
+                        mutate(Label = case_when(quantile == 10 ~ "D10",
+                                                 quantile == 20 ~ "V20",
+                                                 quantile == 50 ~ "C50")) %>% 
+                        select(-c(n, pct, quantile)) %>% 
+                        mutate(Country = "France"), 
+                      tm_top_us %>%
+                        mutate(Country = "United States", boot_se = NA)) %>%
+  mutate(pct = ifelse(share >= .05, paste0(round(100*share, 2), "%"), ""),
+         pct = ifelse(Country == "France" & pct != "", paste0(pct, "\n(", round(boot_se, 3), ")"), pct),
+         temp = ifelse(pct != "", 1, 0)) %>%
+  arrange(Country, Label, temp, -share) %>%
+  group_by(Country, Label, temp) %>%
+  mutate(temp2 = row_number(),
+         pct = ifelse(temp2 == 1 & temp == 0, "<5%", pct)) %>%
+  ungroup() %>% select(-c(temp, temp2)) %>% arrange(Country, Label, child_quantile) %>%
+  mutate(Label = case_when(Label == "D10" ~ "Top 10%",
+                           Label == "V20" ~ "Top 5%",
+                           Label == "C50" ~ "Top 2%"))
+
+top_10 <- tm_top_fr_us %>%
+  mutate(child_quantile = as.numeric(child_quantile),
+         Label = fct_relevel(Label, "Top 10%", "Top 5%", "Top 2%"),
+         share_label = ifelse(child_quantile >= family_quantile - 4, pct, "")) %>%
+  filter(Label == "Top 10%") %>%
+  arrange(Country, family_quantile, child_quantile) %>%
+  ggplot(aes(x = Country, fill = child_quantile,  
+    y = share, label = share_label)) +
+  geom_bar(stat = "identity") + 
+  geom_text(position = position_stack(vjust = 0.5), color = "white", size = 3) +
+  scale_y_continuous(breaks = NULL, expand = c(0,0)) +
+  labs(y = NULL,
+       x = NULL,
+       fill = "Child quantile",
+       title = "Top 10%") +
+  scale_fill_scico(palette = "lajolla", begin = .2, end = .95, breaks = c(1,10), labels = c("Bottom\n10%","Top\n10%")) +
+  theme(legend.position = "right",
+        text = element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        legend.key = element_rect(size = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(1, "cm"),
+        legend.key.width = unit(1, "cm"),
+        axis.text.x = element_text(size = 11),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 12, face = "italic", vjust = 6),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        plot.title = element_text(size = 14, face = "italic"))
+top_10
+
+top_5 <- tm_top_fr_us %>%
+  mutate(child_quantile = as.numeric(child_quantile),
+         Label = fct_relevel(Label, "Top 10%", "Top 5%", "Top 2%"),
+         share_label = ifelse(child_quantile >= family_quantile - 4, pct, "")) %>%
+  filter(Label == "Top 5%") %>%
+  arrange(Country, family_quantile, child_quantile) %>%
+  ggplot(aes(x = Country, fill = child_quantile,  
+             y = share, label = share_label)) +
+  geom_bar(stat = "identity") + 
+  geom_text(position = position_stack(vjust = 0.5), color = "white", size = 3) +
+  scale_y_continuous(breaks = NULL, expand = c(0,0)) +
+  labs(y = NULL,
+       x = NULL,
+       fill = "Child quantile",
+       title = "Top 5%") +
+  scale_fill_scico(palette = "lajolla", begin = .2, end = .95, breaks = c(1,20), labels = c("Bottom\n5%","Top\n5%")) +
+  theme(legend.position = "right",
+        text = element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        legend.key = element_rect(size = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(1, "cm"),
+        legend.key.width = unit(1, "cm"),
+        axis.text.x = element_text(size = 11),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 12, face = "italic", vjust = 6),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        plot.title = element_text(size = 14, face = "italic"))
+top_5
+
+top_2 <- tm_top_fr_us %>%
+  mutate(child_quantile = as.numeric(child_quantile),
+         Label = fct_relevel(Label, "Top 10%", "Top 5%", "Top 2%"),
+         share_label = ifelse(child_quantile >= family_quantile - 4, pct, "")) %>%
+  filter(Label == "Top 2%") %>%
+  arrange(Country, family_quantile, child_quantile) %>%
+  ggplot(aes(x = Country, fill = child_quantile,  
+             y = share, label = share_label)) +
+  geom_bar(stat = "identity", position = "fill") + 
+  geom_text(position = position_fill(vjust = 0.5), color = "white", size = 3) +
+  scale_y_continuous(breaks = NULL, expand = c(0,0)) +
+  labs(y = NULL,
+       x = NULL,
+       fill = "Child quantile",
+       title = "Top 2%") +
+  scale_fill_scico(palette = "lajolla", begin = .2, end = .95, breaks = c(1,50), labels = c("Bottom\n2%","Top\n2%")) +
+  theme(legend.position = "right",
+        text = element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        legend.key = element_rect(size = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(1, "cm"),
+        legend.key.width = unit(1, "cm"),
+        axis.text.x = element_text(size = 11),
+        legend.text = element_text(size = 10),
+        legend.title = element_text(size = 12, face = "italic", vjust = 6),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        plot.title = element_text(size = 14, face = "italic"))
+top_2
+
+top_10 + top_5 + top_2 + plot_annotation(tag_levels = "A")
+ggsave(paste0(fig_final_path, "appendix C/figC12_matrix_detailedcomp_us.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+
+## Appendix D
+
+### Fig D1. Correlation Between Department Characteristics
+
+```{r}
+correlations <- fread(paste0(data_intergen, "figD1_dep_correlations.csv")) |> 
+  mutate(across(c(var1, var2), ~ case_when(. == "density_dep" ~ "Density",
+                                           . == "single_dep" ~ "% Single mothers",
+                                           . == "foreign_dep" ~ "% Foreigners",
+                                           . == "lmean_wage_dep" ~ "Mean wage",
+                                           . == "unemp_dep" ~ "Unemployment rate",
+                                           . == "dist_edu_dep" ~ "Distance to HEI",
+                                           . == "highschool_dep" ~ "% HS graduates",
+                                           . == "higher_edu_dep" ~ "# HEI",
+                                           . == "theil_dep" ~ "Theil index",
+                                           . == "sharetop1_dep" ~ "Share top 1%",
+                                           . == "gini_dep" ~ "Gini index",
+                                           . == "amenities_dep" ~ "Cultural amenities",
+                                           . == "pct_crimes_dep" ~ "Criminality",
+                                           . == "participation_dep" ~ "% Voters")))
+         
+# Correlations
+correlations |> 
+  mutate(abs = abs(cor)) |> 
+  ggplot(aes(x = reorder(var1, order1), y = reorder(var2, order2), 
+                         fill = abs, label = round(cor, 2))) +
+  geom_tile() + scale_fill_scico(lim = c(0,1), palette = "lajolla", end = .9) +
+  geom_text(size = 3) +
+  scale_x_discrete(name = NULL, position = "top") +
+  labs(fill = "Correlation coefficient \n(absolute value)") + ylab(NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 0),
+        panel.grid = element_blank())
+ggsave(paste0(fig_final_path, "appendix D/figD1_corr_matrix.pdf"), height = figure_height, width = figure_height + 2)
+```
+
+### Fig D2. Department Characteristics Kept by Lasso
+
+```{r}
+igm_cor <- fread(paste0(data_intergen, "figD2_lasso.csv")) %>%
+  mutate(var_group = case_when(var %in% c("density_dep", "single_dep", "foreign_dep") ~ "Demographic",
+                               var %in% c("lmean_wage_dep", "unemp_dep") ~ "Economic",
+                               var %in% c("dist_edu_dep", "highschool_dep", "higher_edu_dep") ~ "Education",
+                               var %in% c("theil_dep", "sharetop1_dep", "gini_dep") ~ "Inequality",
+                               var %in% c("amenities_dep", "pct_crimes_dep", "participation_dep") ~ "Social Capital"),
+         label = case_when(var == "density_dep" ~ "Density",
+                           var == "single_dep" ~ "% Single mothers",
+                           var == "foreign_dep" ~ "% Foreigners",
+                           var == "lmean_wage_dep" ~ "Mean wage",
+                           var == "unemp_dep" ~ "Unemployment rate",
+                           var == "dist_edu_dep" ~ "Distance to HEI",
+                           var == "highschool_dep" ~ "% HS graduates",
+                           var == "higher_edu_dep" ~ "# HEI",
+                           var == "theil_dep" ~ "Theil index",
+                           var == "sharetop1_dep" ~ "Share top 1%",
+                           var == "gini_dep" ~ "Gini index",
+                           var == "amenities_dep" ~ "Cultural amenities",
+                           var == "pct_crimes_dep" ~ "Criminality",
+                           var == "participation_dep" ~ "% Voters"),
+         lasso = case_when(kept == 1 ~ TRUE,
+                           TRUE ~ FALSE))
+
+igm_cor %>% 
+  mutate(igm_measure = factor(measure, levels = c("ige", "rrc", "aum"), labels = c("Intergenerational Elasticity", "Rank-Rank Correlation", "Absolute Upward Mobility"))) %>% 
+  ggplot(aes(y = label, x = igm_measure, fill = lasso)) +
+  geom_tile(color = "white") +
+  facet_wrap(~ var_group, ncol = 1, scales = "free_y", strip.position = "left") +
+  labs(x= NULL, y = NULL, fill = NULL) +
+  scale_fill_manual(values = c("transparent", my_palette[3])) +
+  theme(plot.title = element_text(size = 14, face = "italic"),
+        legend.position = "none", 
+        legend.justification = "left", 
+        legend.direction = "vertical",
+        strip.placement = "outside",
+        strip.text.y = element_text(face = "bold", size = 10),
+        panel.spacing.y = unit(0.3, "cm"),
+        strip.text.x = element_text(face = "bold"),
+        text = element_text(size = text_size),
+        panel.spacing = unit(3, "lines"))
+ggsave(paste0(fig_final_path, "appendix D/figD2_cor_dep_lasso.pdf"), height = figure_height, width = figure_width)
+```
+
+
+## Appendix E
+
+### Fig E1. Family Position in 1990 Census by Child Birth Cohort
+
+```{r}
+data <- fread(paste0(data_intergen, "figE1_family_position_1990.csv"))
+
+data %>%
+  mutate(status_rp90 = fct_relevel(L2_90, "Adult of main family", "Child of main family", "Adult of secondary family", "Child of secondary family", "Not part of family", "Not in 1990 census")) %>%
+  filter(!is.na(pct)) %>%
+  ggplot(aes(x = birth_year, y = pct, fill = status_rp90)) +
+  geom_bar(position = "stack", stat = "identity", alpha = alpha) +
+  scale_y_continuous(labels = scales::percent, expand = c(0,0)) +
+  scale_x_continuous(expand = c(0,0), breaks = seq(1965, 1989, 4)) +
+  scale_fill_scico_d(palette = "lajolla", begin = .2, end = .95, direction = -1) +
+  labs(y = "% of birth cohort",
+       x = "Birth cohort",
+       fill = "Status:") +
+  theme(legend.title = element_text(size = 12, face = "italic"),
+        panel.grid.major.x = element_blank(),
+        panel.spacing.y = unit(0, "cm"),
+        legend.direction = "vertical",
+        legend.position = "right",
+        legend.key = element_rect(size = 6),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(1.5, "cm"),
+        legend.key.width = unit(.75, "cm"),
+        text = element_text(size = text_size))
+ggsave(paste0(fig_final_path, "appendix E/figE1_rp90_status_6589_bar.pdf"), height = figure_height, width = figure_width)
+```
+
+### Fig E2. Baseline IGE Estimates for Different Child and Parent Income Definitions
+
+```{r}
+# Baseline IGE estimates for all possibilities, including household wage, using bootstrapped standard errors ----
+ige_w_hhwage <- fread(paste0(data_intergen, "figE2_IGE_child_inc_var_boot.csv")) %>% 
+  mutate(child_inc_var = case_when(child_var == "household_income" ~ "Household income",
+                                   child_var == "household_wage" ~ "Household wage",
+                                   child_var == "individual_income" ~ "Individual income",
+                                   child_var == "labor_income" ~ "Individual wage"),
+         parent_inc_var = case_when(parents_var == "family_income_n" ~ "Family income",
+                                    parents_var == "father_income" ~ "Father income"),
+         sample = case_when(subsample == "F" ~ "Daughters",
+                            subsample == "M" ~ "Sons",
+                            subsample == "FM" ~ "All"))
+
+ige_w_hhwage %>%
+  mutate(parent_inc_var = factor(parent_inc_var, labels = c("Parent household wage", "Father wage")),
+         sample = fct_relevel(sample, "All", "Sons", "Daughters")) %>% 
+  ggplot(aes(x = sample, y = coef, fill = child_inc_var)) +
+  geom_bar(stat="identity", position = position_dodge(width = .5), width = .4, alpha = alpha) +
+  geom_errorbar(aes(ymin = boot_lb, ymax = boot_ub), position = position_dodge(width = .5), color = "black", width = .1) +
+  geom_text(aes(y = ub + 0.02, label = substr(as.character(round(coef, 2)),2,4), color = child_inc_var), position = position_dodge(width = .5), show.legend = FALSE, size = 5) +
+  facet_wrap(~ parent_inc_var) +
+  scale_fill_manual(values = alpha(my_palette[c(5,4,2,1)], alpha)) +
+  scale_color_manual(values = alpha(my_palette[c(5,4,2,1)], alpha)) +
+  scale_y_continuous(limits = c(0, .7), expand = c(0,0)) +
+  labs(x = NULL,
+       y = NULL,
+       fill = "Child income definition:") +
+  theme(legend.position = c(0.01,1),
+        legend.justification = c(0,1),
+        legend.title = element_text(size=12, face = "italic"),
+        plot.caption = element_text(size = 10),
+        text=element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 1))
+ggsave(paste0(fig_final_path, "appendix E/figE2_ige_allchildinc_w_hhwage.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+### Fig E3. Baseline RRC Estimates for Different Child and Parent Income Definitions
+
+```{r}
+# Baseline RRC estimates for all possibilities, including household wage, using bootstrapped standard errors ----
+rrc_w_hhwage <- fread(paste0(data_intergen, "figE3_RRC_child_inc_var_boot.csv")) %>%
+  mutate(child_inc_var = case_when(child_var == "household_income" ~ "Household income",
+                                   child_var == "household_wage" ~ "Household wage",
+                                   child_var == "individual_income" ~ "Individual income",
+                                   child_var == "labor_income" ~ "Individual wage"),
+         parent_inc_var = case_when(parents_var == "family_income_n" ~ "Family income",
+                                    parents_var == "father_income" ~ "Father income"),
+         sample = case_when(subsample == "F" ~ "Daughters",
+                            subsample == "M" ~ "Sons",
+                            subsample == "FM" ~ "All"))
+
+rrc_w_hhwage %>%
+  mutate(parent_inc_var = factor(parent_inc_var, labels = c("Parent household wage", "Father wage")),
+         sample = fct_relevel(sample, "All", "Sons", "Daughters")) %>% 
+  ggplot(aes(x = sample, y = coef, fill = child_inc_var)) +
+  geom_bar(stat="identity", position = position_dodge(width = .5), width = .4, alpha = alpha) +
+  geom_errorbar(aes(ymin = boot_lb, ymax = boot_ub), position = position_dodge(width = .5), color = "black", width = .1) +
+  geom_text(aes(y = ub + 0.015, label = substr(as.character(round(coef, 2)),2,4), color = child_inc_var), position = position_dodge(width = .5), show.legend = FALSE, size = 5) +
+  facet_wrap(~ parent_inc_var) +
+  scale_fill_manual(values = alpha(my_palette[c(5,4,2,1)], alpha)) +
+  scale_color_manual(values = alpha(my_palette[c(5,4,2,1)], alpha)) +
+  scale_y_continuous(limits = c(0, .45), expand = c(0,0)) +
+  labs(x = NULL,
+       y = NULL,
+       fill = "Child income definition:") +
+  theme(legend.position = c(0.01,1),
+        legend.justification = c(0,1),
+        legend.title = element_text(size=12, face = "italic"),
+        plot.caption = element_text(size = 10),
+        text=element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid.major.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 1))
+ggsave(paste0(fig_final_path, "appendix E/figE3_rrc_allchildinc_w_hhwage.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+### Fig E4. Baseline Quintile Transition Matrix for Different Child Income Definitions
+
+```{r}
+# Transition matrix - All child income (Appendix), including household wage ----
+matrix_w_hhwage <- fread(paste0(data_intergen, "figE4_TM_child_inc_var_boot.csv")) %>% 
+  mutate(child_inc_var = case_when(variable == "household_income" ~ "Household income",
+                                   variable == "household_wage" ~ "Household wage",
+                                   variable == "individual_income" ~ "Individual income",
+                                   variable == "labor_income" ~ "Individual wage"))
+
+matrix_w_hhwage %>%
+  mutate(parent_qtile = factor(family_quintile, levels = 1:5, labels = c("Bottom 20%", "2", "3", "4", "Top 20%")),
+         child_qtile = factor(child_quintile, levels = 1:5, labels = c("Bottom 20%", "2", "3", "4", "Top 20%"))) %>%
+  ggplot(aes(x = factor(parent_qtile), y = share, fill = forcats::fct_rev(factor(child_qtile)), 
+             label = paste0(round(share*100,1), "%\n(", round(boot_se, 3), ")"))) +
+  geom_bar(stat = "identity", alpha = alpha) +
+  geom_text(size = 3, position = position_stack(vjust = 0.5), col = "white") +
+  facet_grid(cols = vars(child_inc_var)) +
+  scale_y_continuous(breaks = seq(0,100,20), expand = c(0,0)) +
+  labs(
+    x = "Parent household wage quintile",
+    y = NULL,
+    fill = "Child income quintile:"
+  ) +
+  theme(legend.position = "top",
+        text=element_text(size = 16),
+        strip.text.x = element_text(face = "bold"),
+        panel.spacing = unit(1.5, "lines"),
+        legend.key = element_rect(size = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(1, "cm"),
+        legend.key.width = unit(1, "cm"),
+        axis.text.x = element_text(size = 11),
+        legend.text = element_text(size = 14),
+        legend.title = element_text(size = 12, face = "italic"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid.major = element_blank()) +
+  scale_fill_manual(values = my_palette[c(5,4,3,2,1)], guide = guide_legend(reverse = TRUE))
+ggsave(paste0(fig_final_path, "appendix E/figE4_matrix_allchildinc_w_hhwage.pdf"), height = figure_height, width = figure_width)
+# ----
+```
+
+### Fig E5. Rank-Rank Correlation and Upward Mobility in International Comparison
+
+```{r}
+# figure comparing rrc estimates
+rrc_int <- tribble(   ~country,           ~rrc,    ~study_det,           ~study,
+                      "Switzerland",      0.140,       "Chuard-Keller and Grassi<br>(2021, Figure1)", "Chuard-Keller and Grassi (2021)",
+                      "Spain",            0.195,      "Soria Espín (2022, Figure 1)", "Soria Espín (2022)",
+                      "Sweden",           0.197,      "Heidrich (2017, Table 2)", "Heidrich (2017)",
+                      "Denmark",          0.203,      "Helsø (2021, Table 1)", "Helsø (2021)",
+                      "Australia",        0.215,      "Deutscher and Mazumder (2020, Table 2)", "Deutscher and Mazumder (2020)",
+                      " Sweden",           0.215,      "Bratberg et al. (2017, Table 3)", "Bratberg et al. (2017)",
+                      "Norway",           0.223,      "Bratberg et al. (2017, Table 3)", "Bratberg et al. (2017)",
+                      "Canada",           0.242,      "Corak (2020, Table 5)", "Corak (2020)",
+                      "Germany",          0.245,      "Bratberg et al. (2017, Table 3)", "Bratberg et al. (2017)",
+                      " Denmark",          0.253,      "Landersø and Heckman (2017, Table A17)", "Landersø and Heckman (2017)",
+                      "  Denmark",          0.257,      "Eriksen (2018, Table 3.2)", "Eriksen (2018)",
+                      "Italy",            0.300,       "Acciari, Polo and Violante (2022, p.145)", "Acciari, Polo and Violante (2022)",
+                      "France",           0.303,      "own calculations", "own calculations",
+                      "United States",    0.341,      "Chetty et al. (2014, Table 1)", "Chetty et al. (2014)",
+                      " United States",    0.395,      "Bratberg et al. (2017, Table 3)", "Bratberg et al. (2017)")
+setDT(rrc_int)
+rrc_int <- rrc_int %>%
+  mutate(country_lab = glue("{country}<br><i style='color:#818282; font-size:13px'>{study}</i>"))
+
+graph_rrc <- rrc_int %>% 
+  ggplot(aes(x = rrc, y = fct_reorder(country_lab, -rrc), fill = rrc)) +
+  geom_bar(stat = "identity", alpha = alpha) +
+  geom_text(aes(label = sprintf("%.3f", rrc), x = rrc + .01), hjust = "left", color = "#434444", size = 4.5) +
+  scale_y_discrete(expand = c(0,0)) +
+  scale_x_continuous(lim = c(0,.48), expand = c(0,0)) +
+  scale_fill_scico(palette = "lajolla", begin = .2, end = .95) +
+  labs(y = NULL, x = NULL, title = "Rank-Rank Correlation") +
+  theme(legend.position = "none",
+        text = element_text(size = text_size),
+        panel.grid.major.y = element_blank(),
+        axis.text.y = element_markdown())
+graph_rrc
+
+# figure comparing transition matrix estimates
+mat_int <- tribble(   ~country,     ~p_top20_bot20,     ~p_bot20_bot20,     ~p_top20_top20,    ~study_det, ~study,
+                      "United States",   7.5,               33.7,                 36.5,        "Chetty et al.<br>(2014, Table 2)", "Chetty et al. (2014)",
+                      "Italy",           8.6,               36.7,                 27.8,      "Acciari et al.<br>(2022)", "Acciari et al. (2022)",
+                      "France",          9.7,              31.8,                   38.4,       "own calculations", "own calculations",
+                      "Denmark",         10.7,              30.7,                 34.8,      "Eriksen<br>(2018, Figure 3.3)", "Eriksen (2018)",
+                      "Netherlands",     11.3,              29.8,                 33.1,     "Carmichael et al.<br>(2020, Table 1)", "Carmichael et al. (2020)",
+                      "Canada",          11.4,              30.1,                 32.3,      "Corak<br>(2020, Table 6)", "Corak (2020)",
+                      " Switzerland",     11.9,              23.7,                 30.3,     "Chuard-Keller and Grassi<br>(2021, Table 2)", "Chuard-Keller and Grassi (2021)",
+                      "Spain",           12.3,              25.3,                 33.3,     "Soria Espín<br>(2022, Table A.5)", "Soria Espín (2022)",
+                      "Australia",       12.3,              31,                   30.7,     "Deutscher and Mazumder<br>(2020, Table 3)", "Deutscher and Mazumder (2020)",
+                      "Switzerland",     12.8,              24.5,                 28.8,      "Kalambaden and Martinez<br>(2021, Table 5)", "Kalambaden and Martinez (2021)",
+                      "Sweden",          15.7,              26.3,                 34.5,       "Heidrich<br>(2017, Figure 10, Appendix B)", "Heidrich (2017)")
+
+setDT(mat_int)
+mat_int_long <- mat_int %>% 
+  pivot_longer(cols = contains("20"),
+               names_to = "transition",
+               values_to = "value") %>% 
+  mutate(transition = case_when(transition == "p_top20_bot20" ~ "P(Top 20% | Bot. 20%)",
+                                transition == "p_bot20_bot20" ~ "P(Bot. 20% | Bot. 20%)",
+                                transition == "p_top20_top20" ~ "P(Top 20% | Top 20%)"))
+
+# rank <- mat_int_long %>% 
+#   filter(transition == "P(Top 20% | Bot. 20%)") %>% 
+#   arrange(value) %>% 
+#   mutate(rank = 1:n()) %>% 
+#   select(country, rank)
+
+graph_mat <- mat_int_long %>% 
+  filter(transition == "P(Top 20% | Bot. 20%)") %>% 
+  mutate(country_lab = glue("{country}<br><i style='color:#818282; font-face:italic; font-size:13px'>{study}</i>")) %>% 
+  # left_join(rank) %>% 
+  ggplot(aes(x = value/100, y = fct_reorder(country_lab, value), fill = value/100)) +
+  geom_bar(stat = "identity", alpha = alpha) +
+  geom_text(aes(label = paste0(value, "%"), x = value/100 + 0.005), hjust = "left", color = "#434444", size = 4.5) +
+  # facet_wrap(~ transition) +
+  scale_x_continuous(lim = c(0, .23), expand = c(0,0), labels = scales::percent_format(1L)) +
+  scale_y_discrete(expand = c(0,0)) +
+  scale_fill_scico(palette = "lajolla", begin = .2, end = .95, direction = -1) +
+  labs(x = NULL, y = NULL, title = "P(Top 20% | Bot. 20%)") +
+  theme(legend.position = "none",
+        panel.grid.major.y = element_blank(),
+        axis.text.y = element_markdown(),
+        text = element_text(size = text_size))
+graph_mat
+
+graph_rrc + graph_mat
+ggsave(paste0(fig_final_path, "appendix E/figE5_rrc_mat_int_comp.pdf"), height = figure_height, width = figure_width)
+```
+
+### Fig E6. Higher Education Graduation by Quintile Transition Matrix Cell
+
+```{r}
+he_grad <- read.csv(paste0(data_intergen, "figE6_higher_edu_tm.csv")) |>
+  mutate(pct = pct/100,
+         child_quintile2 = case_when(child_quintile == 1 ~ "Bottom 20%",
+                                     child_quintile == 5 ~ "Top 20%",
+                                     TRUE ~ as.character(child_quintile)),
+         family_quintile2 = case_when(family_quintile == 1 ~ "Bottom 20%",
+                                      family_quintile == 5 ~ "Top 20%",
+                                      TRUE ~ as.character(family_quintile)))
+
+he_grad |> 
+  ggplot(aes(x = reorder(family_quintile, family_quintile2), 
+           fill = reorder(child_quintile2, desc(child_quintile)),  
+           y = pct, label = paste0(round(100 * pct, 1), "%"))) +
+  geom_bar(stat = "identity", alpha = alpha) +
+  geom_text(position = position_stack(vjust = .5), color = "white") +
+  labs(x = "Parent household wage quintile", y = NULL) +
+  facet_wrap(~reorder(child_quintile2, desc(child_quintile)), nrow = 5, shrink = T) +
+  scale_fill_manual(values = my_palette[c(5,4,3,2,1)], name = "Child quintile:") +
+  scale_y_continuous(limits = c(0,1), breaks = seq(0,1.2), expand = c(0,0)) +
+  theme(legend.title = element_text(size = 12, face = "italic"),
+        axis.text.y = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        panel.grid.major.x = element_blank(),
+        panel.spacing.y = unit(0, "cm"),
+        legend.direction = "vertical",
+        legend.position = "right",
+        legend.key = element_rect(size = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(2, "cm"),
+        legend.key.width = unit(1, "cm"),
+        strip.background = element_blank(),
+        strip.text.x = element_blank(),
+        text = element_text(size = text_size))
+ggsave(paste0(fig_final_path, "appendix E/figE6_matrix_higherducation.pdf"), height = figure_height, width = figure_width)
+```
+
+### Fig E7. French Departments
+
+```{r}
+dep_shp <- read_sf(paste0("figures/other_data/shapefile/DEPARTEMENT.shp"))
+
+dep_group <- c(75, 92, 93, 94)
+x_shift <- 300000
+y_shift <- 180000
+resize_factor <- 3.5
+
+centroid <- deframe(st_centroid(dep_shp %>% filter(CODE_DEPT %in% dep_group) %>% select(geometry) %>% st_combine()))
+x_centroid <- centroid[1] + x_shift
+y_centroid <- centroid[2] + y_shift
+
+
+for (i in dep_group) {
+  
+  poly <- dep_shp %>% filter(CODE_DEPT == i) %>% select(geometry) %>% deframe() %>% unlist()
+  
+  x_diff <- poly[1:(length(poly)/2)] + x_shift - x_centroid
+  y_diff <- poly[((length(poly)/2) + 1):length(poly)] + y_shift - y_centroid
+  
+  x_poly <- x_centroid + resize_factor * x_diff
+  y_poly <- y_centroid + resize_factor * y_diff
+  
+  
+  assign(paste0("poly", i), st_sfc(st_polygon(list(cbind(x_poly, y_poly)))))
+}
+
+dep_shp <- dep_shp %>%
+  mutate(NOM_DEPT = ifelse(CODE_DEPT %in% dep_group, " ", NOM_DEPT)) %>%
+  bind_rows(dep_shp %>%
+              filter(CODE_DEPT %in% dep_group) %>%
+              arrange(CODE_DEPT) %>%
+              mutate(geometry = st_geometry(c(poly75, poly92, poly93, poly94))) %>%
+              st_set_crs(2154))
+
+
+
+dep_shp <- dep_shp %>%
+  group_by(NOM_DEPT) %>%
+  mutate(centro = st_centroid(geometry),
+         x_centro = unlist(centro)[1],
+         y_centro = unlist(centro)[2],
+         name = case_when(NOM_DEPT == "AIN" ~ "Ain",
+                          NOM_DEPT == "AISNE" ~ "Aisne",
+                          NOM_DEPT == "ALLIER" ~ "Allier",
+                          NOM_DEPT == "ALPES-DE-HAUTE-PROVENCE" ~ "Alpes de Haute\nProvence",
+                          NOM_DEPT == "ALPES-MARITIMES" ~ "Alpes\nMaritimes",
+                          NOM_DEPT == "ARDECHE" ~ "Ardèche",
+                          NOM_DEPT == "ARDENNES" ~ "Ardennes",
+                          NOM_DEPT == "ARIEGE" ~ "Ariège",
+                          NOM_DEPT == "AUBE" ~ "Aube",
+                          NOM_DEPT == "AUDE" ~ "Aude",
+                          NOM_DEPT == "AVEYRON" ~ "Aveyron",
+                          NOM_DEPT == "BAS-RHIN" ~ "Bas Rhin",
+                          NOM_DEPT == "BOUCHES-DU-RHONE" ~ "Bouches du Rhône",
+                          NOM_DEPT == "CALVADOS" ~ "Calvados",
+                          NOM_DEPT == "CANTAL" ~ "Cantal",
+                          NOM_DEPT == "CHARENTE" ~ "Charente",
+                          NOM_DEPT == "CHARENTE-MARITIME" ~ "Charente\nMaritime",
+                          NOM_DEPT == "CHER" ~ "Cher",
+                          NOM_DEPT == "CORREZE" ~ "Corrèze",
+                          NOM_DEPT == "CORSE-DU-SUD" ~ "Corse\ndu Sud",
+                          NOM_DEPT == "COTE-D'OR" ~ "Côte d'Or",
+                          NOM_DEPT == "COTES-D'ARMOR" ~ "Côtes d'Armor",
+                          NOM_DEPT == "CREUSE" ~ "Creuse",
+                          NOM_DEPT == "DEUX-SEVRES" ~ "Deux\nSèvres",
+                          NOM_DEPT == "DORDOGNE" ~ "Dordogne",
+                          NOM_DEPT == "DOUBS" ~ "Doubs",
+                          NOM_DEPT == "DROME" ~ "Drôme",
+                          NOM_DEPT == "ESSONNE" ~ "Essonne",
+                          NOM_DEPT == "EURE" ~ "Eure",
+                          NOM_DEPT == "EURE-ET-LOIR"  ~ "Eure et Loir",
+                          NOM_DEPT == "FINISTERE" ~ "Finistère",
+                          NOM_DEPT == "GARD" ~ "Gard",
+                          NOM_DEPT == "GERS" ~ "Gers",
+                          NOM_DEPT == "GIRONDE" ~ "Gironde",
+                          NOM_DEPT == "HAUT-RHIN" ~ "Haut Rhin",
+                          NOM_DEPT == "HAUTE-CORSE" ~ "Haute\nCorse",
+                          NOM_DEPT == "HAUTE-GARONNE" ~ "Haute Garonne",
+                          NOM_DEPT == "HAUTE-LOIRE" ~ "Haute Loire",
+                          NOM_DEPT == "HAUTE-MARNE" ~ "Haute Marne",
+                          NOM_DEPT == "HAUTE-SAONE" ~ "Haute Saône",
+                          NOM_DEPT == "HAUTE-SAVOIE" ~ "Haute Savoie",
+                          NOM_DEPT == "HAUTE-VIENNE" ~ "Haute\nVienne",
+                          NOM_DEPT == "HAUTES-ALPES" ~ "Hautes Alpes",
+                          NOM_DEPT == "HAUTES-PYRENEES" ~ "Hautes\nPyrénées",
+                          NOM_DEPT == "HAUTS-DE-SEINE" ~ "\nHauts\nde Seine",
+                          NOM_DEPT == "HERAULT" ~ "Hérault",
+                          NOM_DEPT == "ILLE-ET-VILAINE" ~ "Ille et Vilaine",
+                          NOM_DEPT == "INDRE" ~ "Indre",
+                          NOM_DEPT == "INDRE-ET-LOIRE" ~ "Indre et Loire",
+                          NOM_DEPT == "ISERE" ~ "Isère",
+                          NOM_DEPT == "JURA" ~ "Jura",
+                          NOM_DEPT == "LANDES" ~ "Landes",
+                          NOM_DEPT == "LOIR-ET-CHER" ~ "Loir et Cher",
+                          NOM_DEPT == "LOIRE" ~ "Loire",
+                          NOM_DEPT == "LOIRE-ATLANTIQUE" ~ "Loire\nAtlantique",
+                          NOM_DEPT == "LOIRET" ~ "Loiret",
+                          NOM_DEPT == "LOT" ~ "Lot",
+                          NOM_DEPT == "LOT-ET-GARONNE" ~ "Lot et Garonne",
+                          NOM_DEPT == "LOZERE" ~ "Lozère",
+                          NOM_DEPT == "MAINE-ET-LOIRE" ~ "Maine et Loire",
+                          NOM_DEPT == "MANCHE" ~ "Manche",
+                          NOM_DEPT == "MARNE" ~ "Marne",
+                          NOM_DEPT == "MAYENNE" ~ "Mayenne",
+                          NOM_DEPT == "MEURTHE-ET-MOSELLE" ~ "Meurthe\net Moselle",
+                          NOM_DEPT == "MEUSE" ~ "Meuse",
+                          NOM_DEPT == "MORBIHAN" ~ "Morbihan",
+                          NOM_DEPT == "MOSELLE" ~ "Moselle",
+                          NOM_DEPT == "NIEVRE" ~ "Nièvre",
+                          NOM_DEPT == "NORD" ~ "Nord",
+                          NOM_DEPT == "OISE" ~ "Oise",
+                          NOM_DEPT == "ORNE" ~ "Orne",
+                          NOM_DEPT == "PARIS" ~ "Paris",
+                          NOM_DEPT == "PAS-DE-CALAIS" ~ "Pas de Calais",
+                          NOM_DEPT == "PUY-DE-DOME" ~ "Puy de Dôme",
+                          NOM_DEPT == "PYRENEES-ATLANTIQUES" ~ "Pyrénées Atlantiques",
+                          NOM_DEPT == "PYRENEES-ORIENTALES" ~ "Pyrénées Orientales",
+                          NOM_DEPT == "RHONE" ~ "Rhône",
+                          NOM_DEPT == "SAONE-ET-LOIRE" ~ "Saône et Loire",
+                          NOM_DEPT == "SARTHE" ~ "Sarthe",
+                          NOM_DEPT == "SAVOIE" ~ "Savoie",
+                          NOM_DEPT == "SEINE-ET-MARNE" ~ "Seine\net Marne",
+                          NOM_DEPT == "SEINE-MARITIME" ~ "Seine Maritime",
+                          NOM_DEPT == "SEINE-SAINT-DENIS" ~ "Seine\nSaint Denis",
+                          NOM_DEPT == "SOMME" ~ "Somme",
+                          NOM_DEPT == "TARN" ~ "Tarn",
+                          NOM_DEPT == "TARN-ET-GARONNE" ~ "Tarn et Garonne",
+                          NOM_DEPT == "TERRITOIRE DE BELFORT" ~ "Territoire\nde Belfort",
+                          NOM_DEPT == "VAL-D'OISE" ~ "Val d'Oise",
+                          NOM_DEPT == "VAL-DE-MARNE" ~ "Val de Marne",
+                          NOM_DEPT == "VAR" ~ "Var",
+                          NOM_DEPT == "VAUCLUSE" ~ "Vaucluse",
+                          NOM_DEPT == "VENDEE" ~ "Vendée",
+                          NOM_DEPT == "VIENNE" ~ "Vienne",
+                          NOM_DEPT == "VOSGES" ~ "Vosges",
+                          NOM_DEPT == "YONNE" ~ "Yonne",
+                          NOM_DEPT == "YVELINES" ~ "Yvelines"))
+ggplot() + 
+  geom_sf(data = dep_shp, alpha = .25, color = "grey80") +
+  
+  geom_sf(data = dep_shp %>% 
+            filter(CODE_DEPT %in% dep_group & NOM_DEPT != " ") %>% 
+            select(geometry) %>% 
+            st_union(), color = alpha("grey60", .4), fill = NA, size = .8) +
+  
+  geom_sf(data = dep_shp %>% 
+            filter(!(CODE_DEPT %in% c("2A", "2B") | (CODE_DEPT %in% dep_group & NOM_DEPT != " "))) %>% 
+            select(geometry) %>% 
+            st_union(), color = alpha("grey60", .4), fill = NA, size = .8) +
+  
+  geom_sf(data = dep_shp %>% 
+            filter(CODE_DEPT %in% c("2A", "2B")) %>% 
+            select(geometry) %>% 
+            st_union(), color = alpha("grey60", .4), fill = NA, size = .8) +
+  
+  geom_text(data = dep_shp, mapping = aes(x = x_centro, y = y_centro, label = name, lineheight = .9), size = 3) +
+  geom_sf(data = st_sfc(st_linestring(matrix(c(652000, 910000, 
+                                               6862000, 7015000), nrow = 2))) %>%
+            st_as_sf(crs = st_crs(dep_shp)), color = alpha("grey40", .8)) + theme_void()
+
+ggsave(paste0(fig_final_path, "appendix E/figE7_map_france.pdf"), width = 12, height = 12)
+```
+
+### Fig E8. Illustration of Absolute Upward Mobility for the Nord Department
+
+```{r}
+figE8 <- fread(paste0(data_intergen, "figE8_Nord_cef.csv"))
+
+figE8 %>%
+ggplot(aes(x = family_income_n_spatial_household_income_rank, y = child_rank)) + 
+  geom_point(alpha = alpha, color = my_palette[3], size = 2) + 
+  geom_smooth(method = "lm", se = FALSE, color = my_palette[3]) +
+  geom_segment(aes(x = 25, xend = 25, y = 0, yend = unique(figE8$aum59)), 
+               size = 1, linetype = "longdash", color = "gray20") +
+  geom_segment(aes(x = 0, xend = 25, y = unique(figE8$aum59), yend = unique(figE8$aum59)), 
+               size = 1, linetype = "longdash", color = "gray20") +
+  annotate("text", x = 0, y = unique(figE8$aum59) + 1.5, 
+           label = paste0("AUM = ", round(unique(figE8$aum59), 1), " (", 
+                          read.csv(paste0(data_intergen, "figE13_ordered_aum_boot.csv")) %>% 
+                            filter(dep == 59) %>% pull(boot_se_aum) %>% round(2), ")"), 
+           #color = "##EB9050", 
+           hjust = 0, vjust = 0, size = 5) + 
+  scale_y_continuous(name = "Mean child household income rank", limits = c(0, 100), expand = c(0,0)) +
+  scale_x_continuous(expand = c(0.01,0.01)) +
+  xlab("Parent household wage rank") +
+  theme(text = element_text(size = text_size))
+
+ggsave(paste0(fig_final_path, "appendix E/figE8_p25_illustration.pdf"), height = figure_height, width = figure_width)
+```
+
+### Fig E9. Department-Level Log-Log Relationships
+
+```{r}
+figE9 <- fread(paste0(data_intergen, "figE9_local_log_cef.csv"))
+dep_lab <- read.csv(here("figures/other_data/departement_2022.csv")) |> 
+  select(dep = DEP, dep_lab = LIBELLE) |> 
+  mutate(dep = as.numeric(dep))
+
+figE9 <- figE9 |> 
+  left_join(dep_lab)
+
+figE9 |> 
+  ggplot(aes(x = family_log_income_n, y = household_log_income)) + 
+  geom_point(alpha = alpha, color = my_palette[3], size = 2) + 
+  geom_smooth(method = "lm", se = F, formula = y ~ x, color = my_palette[3]) +
+  facet_wrap(~reorder(dep_lab, rank_dep), nrow = 8) +
+  ylab("Mean log child household income") +
+  xlab("Log parent household wage") +
+  theme(strip.placement = "outside",
+        strip.text.y = element_text(face = "bold", size = 14),
+        panel.spacing.y = unit(0.3, "cm"),
+        strip.text.x = element_text(face = "bold"),
+        text = element_text(size = text_size),
+        panel.spacing = unit(3, "lines"))
+ggsave(paste0(fig_final_path, "appendix E/figE9_dep_log_income_cef_page.pdf"), height = 16, width = (16 * 6 )/9)
+```
+
+### Fig E10. Department-Level Rank-Rank Relationships
+
+```{r}
+figE10 <- fread(paste0(data_intergen, "figE10_local_rank_cef.csv"))
+dep_lab <- read.csv(here("figures/other_data/departement_2022.csv")) |> 
+  select(dep = DEP, dep_lab = LIBELLE) |> 
+  mutate(dep = as.numeric(dep))
+
+figE10 <- figE10 |> 
+  left_join(dep_lab)
+
+figE10 |> 
+  ggplot(aes(x = family_ventile, y = child_rank)) + 
+  geom_point(alpha = alpha, color = my_palette[3], size = 2) + 
+  geom_smooth(method = "lm", se = F, formula = y ~ x, color = my_palette[3]) +
+  facet_wrap(~reorder(dep_lab, rank_dep), nrow = 8) +
+  scale_y_continuous(name = "Mean child household income rank", limits = c(0, 100)) +
+  scale_x_continuous(lim = c(0,20)) +
+  xlab("Parent household wage ventile") +
+  theme(strip.placement = "outside",
+        strip.text.y = element_text(face = "bold", size = 14),
+        panel.spacing.y = unit(0.3, "cm"),
+        strip.text.x = element_text(face = "bold"),
+        text = element_text(size = text_size),
+        panel.spacing = unit(3, "lines"))
+
+ggsave(paste0(fig_final_path, "appendix E/figE10_dep_rank_cef_page.pdf"), height = 16, width = (16 * 6 )/9)
+```
+
+### Fig E11. Department-Level Intergenerational Elasticities
+
+```{r}
+figE11 <- fread(paste0(data_intergen, "figE11_sorted_ige_boot.csv")) %>% 
+  mutate(dep = as.numeric(dep)) %>% select(-dep_lab)
+
+dep_lab <- read.csv(here("figures/other_data/departement_2022.csv"), encoding = "UTF-8") %>%
+  filter(as.numeric(DEP) <= 95) %>%
+  select(dep = DEP, dep_lab = LIBELLE) %>%
+  mutate(dep = as.numeric(dep), dep_lab_match = stri_trans_general(str_to_lower(dep_lab), "Latin-ASCII"))
+
+figE11 <- figE11 %>%
+  left_join(dep_lab, by = "dep") %>%
+  mutate(dep_lab = ifelse(dep == 20, "Corse", dep_lab))
+
+# Dep IGE
+figE11 %>%
+  # mutate(se_type = fct_relevel(se_type, "Naive SE", "Bootstrap SE")) %>% 
+  ggplot(aes(x = reorder(dep_lab, ige), y = ige, ymin = lb_boot, ymax = ub_boot)) +
+  geom_point(alpha = alpha) +
+  geom_errorbar(alpha = alpha) +
+  geom_hline(yintercept = figE11$coef[1], linetype = "dashed", color = "black") +
+  scale_y_continuous(lim = c(-0.02, 1.41), breaks = seq(0,2,.2), expand = c(0,0)) + 
+  ylab("Intergenerational elasticity") +
+  xlab(NULL) + labs(color = NULL) + coord_flip()  +
+  theme(axis.text.y = element_text(size = 10),
+        text = element_text(size = text_size),
+        panel.spacing = unit(1.5, "lines"),
+        legend.position = c(0.01,0.99),
+        legend.justification = c(0.01, 0.99),
+        legend.background = element_rect(alpha("white", .5)),
+        legend.key = element_rect(alpha("white", .5)))
+
+ggsave(paste0(fig_final_path, "appendix E/figE11_dep_ige_errorbars.pdf"), height = 12, width = (16 * 6 )/14)
+```
+
+### Fig E12. Department-Level Rank-Rank Correlations
+
+```{r}
+figE12 <- fread(paste0(data_intergen, "figE12_sorted_rrc_boot.csv")) %>% 
+  mutate(dep = as.numeric(dep)) %>% select(-dep_lab)
+
+dep_lab <- read.csv(here("figures/other_data/departement_2022.csv"), encoding = "UTF-8") %>%
+  filter(as.numeric(DEP) <= 95) %>%
+  select(dep = DEP, dep_lab = LIBELLE) %>%
+  mutate(dep = as.numeric(dep), dep_lab_match = stri_trans_general(str_to_lower(dep_lab), "Latin-ASCII"))
+
+figE12 <- figE12 %>%
+  left_join(dep_lab, by = "dep") %>%
+  mutate(dep_lab = ifelse(dep == 20, "Corse", dep_lab))
+
+# Dep RRC
+figE12 %>%
+  # filter(keep_rank == T) %>%
+  # mutate(se_type = fct_relevel(se_type, "Naive SE", "Bootstrap SE")) %>% 
+  ggplot(aes(x = reorder(dep_lab, rrc), y = rrc, ymin = lb_boot, ymax = ub_boot)) +
+  geom_point(alpha = alpha) +
+  geom_errorbar(alpha = alpha) +
+  geom_hline(yintercept = figE12$coef[1], color = "black", linetype = "dashed") +
+  scale_y_continuous(limits = c(-0.01, .61), breaks = seq(0,1,.1), expand = c(0,0)) + 
+  ylab("Rank-rank correlation") +
+  xlab(NULL) + labs(color = NULL) + coord_flip()  +
+  theme(axis.text.y = element_text(size = 10),
+        text = element_text(size = text_size),
+        panel.spacing = unit(1.5, "lines"),
+        legend.position = c(0.01,0.99),
+        legend.justification = c(0.01, 0.99),
+        legend.background = element_rect(alpha("white", .5)),
+        legend.key = element_rect(alpha("white", .5)))
+
+ggsave(paste0(fig_final_path, "appendix E/figE12_dep_rrc_errorbars.pdf"), height = 12, width = (16 * 6 )/14)
+```
+
+### Fig E13. Department-Level Absolute Upward Mobility
+
+```{r}
+fig_aum <- fread(paste0(data_intergen, "figE13_ordered_aum_boot.csv")) %>% 
+  mutate(dep = as.numeric(dep)) %>% select(-dep_lab)
+
+dep_lab <- read.csv(here("figures/other_data/departement_2022.csv"), encoding = "UTF-8") %>%
+  filter(as.numeric(DEP) <= 95) %>%
+  select(dep = DEP, dep_lab = LIBELLE) %>%
+  mutate(dep = as.numeric(dep), dep_lab_match = stri_trans_general(str_to_lower(dep_lab), "Latin-ASCII"))
+
+fig_aum <- fig_aum %>%
+  left_join(dep_lab, by = "dep") %>%
+  mutate(dep_lab = ifelse(dep == 20, "Corse", dep_lab))
+
+# Dep RRC
+fig_aum %>% na.omit() %>%
+  # filter(keep_rank == T) %>%
+  # mutate(se_type = fct_relevel(se_type, "Naive SE", "Bootstrap SE")) %>% 
+  ggplot(aes(x = reorder(dep_lab, -aum), y = aum, ymin = lb_boot, ymax = ub_boot)) +
+  geom_point(alpha = alpha) +
+  geom_errorbar(alpha = alpha) +
+  geom_hline(yintercept = 42.7704, color = "black", linetype = "dashed") +
+  scale_y_continuous(limits = c(29.9, 60.1), breaks = seq(30, 60, 10), expand = c(0,0)) + 
+  ylab("Absolute Upward Mobility") +
+  xlab(NULL) + labs(color = NULL) + coord_flip()  +
+  theme(axis.text.y = element_text(size = 10),
+        text = element_text(size = text_size),
+        panel.spacing = unit(1.5, "lines"),
+        legend.position = c(0.01,0.99),
+        legend.justification = c(0.01, 0.99),
+        legend.background = element_rect(alpha("white", .5)),
+        legend.key = element_rect(alpha("white", .5)))
+
+ggsave(paste0(fig_final_path, "appendix E/figE13_dep_aum_errorbars.pdf"), height = 12, width = (16 * 6 )/14)
+```
+
+### Fig E14. Department-Level Unemployment Rate in 1990
+
+```{r}
+# Covariates
+############
+data_cov <- read.csv(paste0(data_intergen, "figE14_dep_characteristics.csv"))
+covariates <- c("density_dep", "unemp_dep", "gini_dep", "highschool_dep", "amenities_dep")
+cov_label <- c("Density", "%Unemployed", "Gini index", "%HS graduates", "Cultural amenities")
+
+dep_shp <- read_sf(here("figures/other_data/shapefile/DEPARTEMENT.shp"))
+
+# Prepare data
+##############
+
+myshp <- dep_shp %>%
+  # Recode Corsica department
+  mutate(dep = as.numeric(ifelse(CODE_DEPT %in% c("2A", "2B"), "20", CODE_DEPT))) %>%
+  # Merge Corsica geometry
+  group_by(dep) %>% summarise(geometry = st_union(geometry)) %>%
+  # Join dep covariates
+  right_join(data_cov |> select(dep, unemp_dep)) 
+
+for (i in "unemp_dep") {
+  
+  temp_plot <- ggplot() +
+    geom_sf(data = myshp, mapping = aes(fill = get(i)), color = "grey60", lwd = .1) +
+    theme(axis.text = element_blank(),
+          axis.line = element_blank(),
+          axis.ticks = element_blank(),
+          legend.position = c(.95, .55),
+          panel.grid.major = element_line(colour = "transparent")) +
+    scale_fill_scico(palette = "lajolla", begin = 0, end = .9) +
+    labs(fill = cov_label[match(i, covariates)])
+  
+  outplot <- paste0(fig_final_path, "appendix E/figE14_map_", i, ".png")
+  ggsave(outplot, height = 6, width = (16 * 6 )/9)
+  
+  # Zoom on IDF
+  crd <- 75
+  squaredIDF <- image_crop(image_read(outplot),
+                           geometry = paste0(crd, "x", crd, "+", 1545, "+", 438),
+                           repage = T)
+  blank_fig <- image_draw(image_blank(150, 150))
+  symbols(crd/2, crd/2, circles = (crd/2) - 3, bg = "black", inches = F, add = T)
+  dev.off()
+  circleIDF <- image_composite(squaredIDF, blank_fig, operator= "copyopacity")
+  zoomIDF <- image_draw(image_composite(image_read(outplot),
+                                        image_scale(circleIDF, "x175"),
+                                        offset = "+2000+80"))
+  lines(c(2016, 1575), c(206, 470))
+  dev.off()
+  image_crop(zoomIDF, "2100x1800+550")
+  image_write(zoomIDF, outplot)
+  image_write(image_crop(image_read(outplot), 
+                         geometry_area(width = 2200, height = 1800,
+                                       x_off = 700, y_off = 0)), outplot)
+}
+```
+
+### Fig E15. Geographic Mobility by Parent HouseholdWage Rank
+
+```{r}
+# Child mobility 
+figE15 <- fread(paste0(data_intergen, "figE15_mobility_cef.csv"))
+
+figE15 |> 
+  ggplot(aes(x = family_income_n_spatial_household_income_rank, y = pct_movers)) + 
+  geom_point(color = my_palette[3], alpha = alpha) + geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = F, color = my_palette[3]) +
+  scale_y_continuous(name = "Percentage of movers", limits = c(0, .8), breaks = seq(0, .8, .2),
+                     labels = scales::percent, expand = c(0,0)) +
+  xlab("Parent household wage rank") +
+  theme(text = element_text(size = text_size))
+
+ggsave(paste0(fig_final_path, "appendix E/figE15_child_mobility.pdf"), height = figure_height, width = figure_width)
+```
+
+### Fig E16. Intergenerational Mobility and Geographic Mobility - Department Ranks
+
+```{r}
+# Mobility rank
+figE16 <- fread(paste0(data_intergen, "figE16_mobility_dep_rank.csv"))
+
+pct_movers <- read.csv(paste0(data_intergen, "in_text_figures.csv")) %>%
+  filter(Label == "%movers all") %>% pull(Figure)
+
+figE16 %>%
+  # left_join(pct) %>% 
+  # mutate(mobility = paste0(mobility, " (", round(pct*100,1), "%)")) %>% 
+  ggplot(aes(x = family_dep_rank, y = child_dep_rank, color = factor(mobility))) + 
+  geom_point(alpha = alpha) +
+  geom_smooth(method = "lm", se = F, formula = y ~ poly(x, 3)) +
+  scale_color_manual(values = rev(alpha(my_palette[c(4,2)], alpha)), name = "Mobility:", 
+                     labels = c(paste0("Stayers (", 100 - round(100*pct_movers, 1), "%)"), 
+                                paste0("Movers (", round(100*pct_movers, 1), "%)"))) +
+  xlab("Parent department household wage rank") +
+  scale_y_continuous(name = "Mean child department household income rank", 
+                     limits = c(20, 80),  breaks = seq(20,80,10), expand = c(0,0)) +
+  theme(legend.position = c(0.01,.99), 
+        legend.justification = c(0,1),
+        legend.direction = "vertical",
+        legend.title = element_text(size = 12, face= "italic"),
+        text = element_text(size = text_size)) +
+  guides(color = guide_legend(reverse = T))
+
+ggsave(paste0(fig_final_path, "appendix E/figE16_cef_dep_rank_mobility.pdf"), height = figure_height, width = figure_width)
+```

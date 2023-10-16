@@ -1,0 +1,622 @@
+---
+title: "PSID Variable Creation"
+author: "Gustave Kenedi and Louis Sirugue"
+date: "`r Sys.time()`"
+format:
+  html:
+    toc: true
+    df-print: paged
+    embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+execute:
+  warning: false
+---
+
+## Objectives
+
+Estimate and compare OLS and TSTSLS rank-rank correlations (RRC), transition matrices, and absolute upward mobility (AUM).
+
+Two levels: national and subnational (large geographic areas due to small sample size)
+
+First-stage predictors:
+
+1.  in our paper:
+
+    i\. education (8 categories),
+
+    ii\. 2-digit occupation (42 cat.),
+
+    iii\. demographic characteristics (birth cohort, French nationality dummy, country of birth (6 cat.), and household structure (6 cat.)), and
+
+    iv\. characteristics of the municipality of residence (unemployment rate, share of single mothers, share of foreigners, population, and population density).
+
+2.  for PSID analysis:
+
+    (i) education (7 categories),
+    (ii) 3-digit occupation (441 occ. + 5 employment status = 446 cat.) (according to https://www.census.gov/content/dam/Census/library/publications/1972/dec/1970-occupation-and-industry-classification-systems.pdf),
+    (iii) demographic characteristics (birth cohort, race (5 cat.)), and
+    (iv) FE state or region of residence.
+
+## Packages
+
+```{r}
+packages <- c("here", "tidyverse", "data.table", "readxl", "janitor", "ggthemr", "caret", "patchwork", "tidymodels","ggtext", "tidylog")
+librarian::shelf(packages, quiet = TRUE)
+rm(packages)
+```
+
+## Functions
+
+```{r}
+source(here("code_lib/useful_functions.R"))
+
+# to obtain various income definitions and defined ages
+source(here("code_lib/inc_fct.R"))
+# to obtain parents' education levels
+source(here("code_lib/parents_edu_fct.R"))
+# to obtain parents' occupation
+source(here("code_lib/parents_occ_fct.R"))
+```
+
+## Params
+
+```{r}
+# figures
+fig_height = 6
+fig_width = (16/9)*fig_height
+ggthemr("pale")
+
+theme_update(text = element_text(size = 10),
+             plot.title = element_text(size = 10, face = "bold"),
+             legend.title = element_text(face = "italic", size = 12),
+             legend.text = element_text(size = 10),
+             legend.background = element_rect(fill = alpha("white", .75)),
+             plot.caption = element_text(size = 8, face = "italic", color = "#7d7d7d"))
+
+# no scientific notation
+options(scipen=999)
+
+# path to data
+data_path <- "~/Dropbox/3resources/data/psid/"
+```
+
+## Load data
+
+```{r}
+#| cache: true
+#| output: false
+
+# PSID variables dictionary
+psid_vars <- read_excel(paste0(data_path, "fims/psid.xlsx")) %>%
+  clean_names() %>%
+  mutate(var_id = 1:n()) %>% 
+  pivot_longer(cols = -c(var_id, type, category, text, head_wife, var_count),
+               names_prefix = "y",
+               names_to = "year",
+               values_to = "variable")
+setDT(psid_vars)
+# family interview id
+psid_vars %>% filter(var_id == 8746) %>% count(text)
+fam_id_vars <- psid_vars %>% filter(var_id == 8746) %>% pull(variable)
+
+# family files 1968-2019
+years <- c(1968:1997, seq(1999, 2019, 2))
+for (i in years) {
+  print(i)
+  
+  if (i %in% 1968:1993) {
+    file_path <- paste0(data_path, "fam", i, "/FAM", i)
+  } else {
+    file_path <- paste0(data_path, "fam", i, "er", "/FAM", i, "ER")
+  }
+  
+  assign(paste0("fam_", i), fread(paste0(file_path, ".csv")))
+}
+
+gc()
+```
+
+## Import intermediate datasets
+
+```{r}
+#| output: false
+
+parents_sample <- fread(here("data/parents_sample.csv"))
+parents_sample_clean <- fread(here("data/parents_sample_clean.csv"))
+parents_sample_long <- fread(here("data/parents_sample_long.csv"))
+
+child_sample <- fread(here("data/child_sample.csv"))
+child_sample_clean <- fread(here("data/child_sample_clean.csv"))
+child_sample_long <- fread(here("data/child_sample_long.csv"))
+
+child_first_parents <- fread(here("data/child_first_parents.csv")) %>% 
+  rename(ind_id_68_child = child_fam) %>% 
+  select(ind_id_68, ind_id_68_child, rel_to_head, gender)
+
+gc()
+```
+
+## Clean parents
+
+## Parents' characteristics
+
+### Education
+
+*Education:* defined as the maximum grade completed over all observations, and classified following Jerrim et al. (2015) / PSID classification of grades completed into education level (7 categories).
+
+Note that for many years the documentation highlights: "This variable contains zeroes for current Heads and Wives/"Wives" because information about completed education was not asked annually for them as it was for other family unit members. Comparability is a problem here because not only is the Head and Wife/"Wife" information available only in bracketed form but also includes codes for receipt of nonacademic training and advanced degrees." (IND2019ER_codebook.pdf)
+
+```{r}
+# initiate variable used data.frame ----
+used_vars <- as_tibble(years)
+# -----
+
+# obtain parents' education level ----
+psid_vars %>% filter(var_id == 65) %>% count(text)
+edu_vars <- psid_vars %>% filter(var_id == 65) %>% pull(variable) # missing for 1969!
+used_vars <- bind_cols(used_vars, edu_vars = edu_vars)
+edu_vars <- edu_vars[!is.na(edu_vars)]
+parents_edu_min25 <- parents_edu_fct(age_min = 25) # takes the maximum number of years of education only for observations when individual is at least 25 years old
+parents_edu <- parents_edu_fct(age_min = 0) # takes the maximum number of years of education only for observations with no age restriction
+parents_edu_min25[, .N, by = ind_id_68] %>% count(N) # 1 observation per parent!
+# ----
+
+# recode parents' education level following Jerrim et al. (2015) code, which is itself largely based on the PSID classification ----
+edu_level_fct <- function(dt) {
+  dt <- dt %>% 
+    mutate(edu_level = case_when(max_edu %in% 1:5 ~ "Grades 1-5",
+                                 max_edu %in% 6:8 ~ "Grades 6-8",
+                                 max_edu %in% 9:11 ~ "Grades 9-11",
+                                 max_edu %in% 12 ~ "Grade 12 (HS completion)",
+                                 max_edu %in% 13:15 ~ "Some college / associate degree",
+                                 max_edu %in% 16 ~ "College degree",
+                                 max_edu %in% 17 ~ "Advanced college degree"),
+           edu_level = factor(edu_level, levels = c("Grades 1-5", "Grades 6-8", "Grades 9-11", "Grade 12 (HS completion)", "Some college / associate degree", "College degree", "Advanced college degree")))
+  
+  return(dt)
+}
+
+parents_edu_min25 <- edu_level_fct(parents_edu_min25)
+parents_edu <- edu_level_fct(parents_edu)
+
+parents_edu %>% count(edu_level) %>% count_to_pct()
+parents_edu_min25 %>% count(edu_level) %>% count_to_pct()
+# ----
+
+# merge with parents_sample_clean
+parents_sample_clean <- parents_sample_clean %>% 
+  left_join(parents_edu) %>% 
+  left_join(parents_edu_min25 %>% rename(max_edu_min25 = max_edu, edu_level_min25 = edu_level))
+parents_sample_clean %>% count(edu_level) %>% count_to_pct() # education missing for 0.09% of parents
+parents_sample_clean %>% count(edu_level_min25) %>% count_to_pct() # education missing for 1.9% of parents
+```
+
+### Occupation (3-digit + inactivity status)
+
+*Problem:* occupation variable classification has varied over time and is only consistent from 1981 onwards:
+
+-   *1968-1975:* 1-digit occupation.
+
+-   *1976-1980:* 2-digit occupation.
+
+-   1968-1980: 3-digit occupation - 1970 classification - only available for a selected sample of PSID heads and wives/"wives".
+
+-   1981-2001: 3-digit occupation - 1970 classification.
+
+Stick with using 3-digit occupation codes and use most common.
+
+*Occupation:* defined as most common 3-digit occupation (1970 classification) between 30 and 50.
+
+[IMPORTANT:]{.underline} 3-digit occupation is only available for a selected sample of PSID heads and wives for waves 1968-1980:
+
+\(i\) original sample Heads and Wives/"Wives still living by 1992 who reported main jobs in at least three waves during the period 1968-1992, with at least one of those reports prior to 1980; and
+
+\(ii\) additionally, original sample Heads and Wives/"Wives" who had reported at least one main job between 1968 and 1980 but were known to have died by 1992. Those who were still living but had reported only one or two jobs during the period of interest were excluded, as were all nonsample Heads and Wives/"Wives".
+
+How can we deal effectively with these missing observations? Many of these individuals have available info on education. I guess we can restrict our analysis to these individuals though this could somewhat bias the sample since it effectively restricts to individuals who have some working history... Using the employment status variables will reduce this bias by providing info on unemployed / out of the labor force, but not occupation for the employed. Seems like best solution possible, though imperfect.
+
+*Employment status:*
+
+-   classification has changed over time but can be reconciled manually.
+-   1968-1978: only available for HEAD in family files.
+-   1979-2019: available for both in main dataset + consistent classification.
+
+```{r}
+# obtain parents' occupation
+# head occupation ----
+psid_vars %>% filter(var_id == 11187) %>% count(text) # 1968-1980 retrospective
+psid_vars %>% filter(var_id == 11185) %>% count(text) # 1981-2001
+
+occ_head_vars_6880 <- psid_vars %>% filter(var_id == 11187) %>% select(variable, year)
+occ_head_vars_6880
+occ_head_vars_6880 <- occ_head_vars_6880 %>% filter(!is.na(variable))
+setDT(occ_head_vars_6880)
+
+occ_head_vars_8101 <- psid_vars %>% filter(var_id == 11185) %>% select(variable, year)
+occ_head_vars_8101
+occ_head_vars_8101 <- occ_head_vars_8101 %>% filter(!is.na(variable))
+setDT(occ_head_vars_8101)
+
+occ_head_vars <- bind_rows(occ_head_vars_6880[year != 1974], occ_head_vars_8101) # for some reason head occupation (not retrospective) is available in 1974
+occ_head_vars <- occ_head_vars %>% pull(variable)
+used_vars <- bind_cols(used_vars, occ_head_vars = c(occ_head_vars, rep(NA, length(years) - length(occ_head_vars))))
+# ----
+
+# spouse occupation ----
+psid_vars %>% filter(var_id == 11188) %>% count(text)
+psid_vars %>% filter(var_id == 11186) %>% count(text)
+
+occ_spouse_vars_6880 <- psid_vars %>% filter(var_id == 11188) %>% select(variable, year)
+occ_spouse_vars_6880
+occ_spouse_vars_6880 <- occ_spouse_vars_6880 %>% filter(!is.na(variable))
+setDT(occ_spouse_vars_6880)
+
+occ_spouse_vars_8101 <- psid_vars %>% filter(var_id == 11186) %>% select(variable, year)
+occ_spouse_vars_8101
+occ_spouse_vars_8101 <- occ_spouse_vars_8101 %>% filter(!is.na(variable))
+setDT(occ_spouse_vars_8101)
+
+occ_spouse_vars <- bind_rows(occ_spouse_vars_6880, occ_spouse_vars_8101)
+occ_spouse_vars <- occ_spouse_vars %>% pull(variable)
+used_vars <- bind_cols(used_vars, occ_spouse_vars = c(occ_spouse_vars, rep(NA, length(years) - length(occ_spouse_vars))))
+# ----
+
+# obtain parents' employment status
+# head emp status 1968-1978 ----
+psid_vars %>% filter(var_id == 10241) %>% count(text)
+emp_head_vars_6878 <- psid_vars %>% filter(var_id == 10241) %>% filter(year %in% 1968:1978) %>% select(variable, year)
+emp_head_vars_6878
+setDT(emp_head_vars_6878)
+emp_head_vars_6878 <- emp_head_vars_6878 %>% pull(variable)
+used_vars <- bind_cols(used_vars, emp_head_vars_6878 = c(emp_head_vars_6878, rep(NA, length(years) - length(emp_head_vars_6878))))
+
+emp_head_6878 <- var_fam_fct(variables = emp_head_vars_6878,
+                             name = "emp_status")
+emp_head_6878 <- emp_head_6878 %>% 
+  mutate(emp_status_lab = case_when((year %in% 1968:1975 & emp_status == 1) | (year %in% 1976:1978 & emp_status %in% 1:2) ~ "Working now, or laid off temporarily",
+                                    (year %in% 1968:1975 & emp_status == 2) | (year %in% 1976:1978 & emp_status %in% 3) ~ "Unemployed",
+                                    (year %in% 1968:1975 & emp_status == 3) | (year %in% 1976:1978 & emp_status %in% 4:5) ~ "Retired, permanently disabled",
+                                    (year %in% 1968:1975 & emp_status == 4) | (year %in% 1976:1978 & emp_status %in% 6) ~ "Housewife",
+                                    (year %in% 1968:1975 & emp_status == 5) | (year %in% 1976:1978 & emp_status %in% 7) ~ "Student",
+                                    (year %in% 1968:1975 & emp_status == 6) | (year %in% 1976:1978 & emp_status %in% 8) ~ "Other"),
+         emp_status_new = case_when(emp_status_lab == "Working now, or laid off temporarily" ~ 1,
+                                    emp_status_lab == "Unemployed" ~ 2,
+                                    emp_status_lab == "Retired, permanently disabled" ~ 3,
+                                    emp_status_lab == "Housewife" ~ 4,
+                                    emp_status_lab == "Student" ~ 5,
+                                    emp_status_lab == "Other" ~ 6))
+parents_emp_6878 <- parents_sample_long %>%
+  filter(substr(rel_head, 1, 1) == 1 & year %in% 1968:1978) %>% 
+  select(ind_id_68, year, itw_num) %>% 
+  left_join(emp_head_6878) %>% 
+  select(ind_id_68, year, emp_status, emp_status_new, emp_status_lab)
+parents_emp_6878 %>% count(emp_status_lab)
+# ----
+
+# head and spouse emp status 1979-2019 ----
+psid_vars %>% filter(var_id == 475) %>% count(text)
+emp_head_spouse_7919_vars <- psid_vars %>% filter(var_id == 475 & year >= 1979) %>% pull(variable)
+used_vars <- bind_cols(used_vars, emp_head_spouse_7919_vars = c(rep(NA, length(years) - length(emp_head_spouse_7919_vars)), emp_head_spouse_7919_vars))
+
+parents_emp_7919 <- var_reshape_fct(dt = parents_sample,
+                                    set_var_names = list(emp_head_spouse_7919_vars),
+                                    names_to_new = "emp_status_vars",
+                                    values_to_new = "emp_status") %>% 
+  select(-emp_status_vars)
+parents_emp_7919 <- parents_emp_7919 %>% 
+  mutate(emp_status_lab = case_when(emp_status %in% 1:2 ~ "Working now, or laid off temporarily",
+                                    emp_status %in% 3 ~ "Unemployed",
+                                    emp_status %in% 4:5 ~ "Retired, permanently disabled",
+                                    emp_status %in% 6 ~ "Housewife",
+                                    emp_status %in% 7 ~ "Student",
+                                    emp_status %in% 8 ~ "Other"),
+         emp_status_new = case_when(emp_status_lab == "Working now, or laid off temporarily" ~ 1,
+                                    emp_status_lab == "Unemployed" ~ 2,
+                                    emp_status_lab == "Retired, permanently disabled" ~ 3,
+                                    emp_status_lab == "Housewife" ~ 4,
+                                    emp_status_lab == "Student" ~ 5,
+                                    emp_status_lab == "Other" ~ 6))
+parents_emp_7919 %>% count(emp_status_lab)
+parents_emp_7919 %>% count(year)
+# ----
+
+# combine together ----
+parents_emp <- bind_rows(parents_emp_6878,
+                         parents_emp_7919)
+parents_emp %>% count(year)
+parents_emp %>% count(emp_status_lab)
+parents_emp %>% count(emp_status_lab, sort = T) %>% count_to_pct()
+# ----
+
+# 3-digit occupation or
+# 1002 = Unemployed
+# 1003 = Retired, permanently disabled
+# 1004 = Housewife
+# 1005 = Student
+# 1006 = Other
+parents_occ_3050 <- parents_occ_fct(age_range = 30:50)
+parents_occ <- parents_occ_fct(age_range = 0:150)
+parents_occ[, .N, by = ind_id_68] %>% count(N) # 1 observation per parent!
+
+# merge with parents_sample_clean
+parents_sample_clean <- parents_sample_clean %>% 
+  left_join(parents_occ %>% select(ind_id_68, occ_3_digit = occupation)) %>% 
+  left_join(parents_occ_3050 %>% select(ind_id_68, occ_3_digit_3050 = occupation))
+
+parents_sample_clean %>% count(is.na(occ_3_digit)) %>% count_to_pct() # missing 1.4%
+parents_sample_clean %>% count(is.na(occ_3_digit_3050)) %>% count_to_pct() # missing 7%
+```
+
+### Race
+
+*Race:* defined as the most recent race observation over all observations (only reason for taking most recent is that classification has evolved over time).
+
+-   *1968-1984*: only available for head.
+
+-   *1985-2019*: available for both head and spouse.
+
+Classification changes over time:
+
+-   *1968-1984*: white, black (wording varies), spanish-american (wording varies), other, NA
+-   *1985-1989*: white, black, american indian/aleut/eskimo, asian/pacific islander, other, NA
+-   *1990-2003*: white, black, native american (wording varies), asian/pacific islander, latino origin or descent (wording varies), color besides black or white (wording varies), other, NA
+-   *2005-2019*: white, black/african american/negro, american indian or alaska native, asian, native hawaiian or pacific islander, other, wild code, NA
+
+```{r}
+# head race 1968-2019 ----
+psid_vars %>% filter(var_id == 844) %>% count(text)
+race_head_vars_6819 <- psid_vars %>% filter(var_id == 844) %>% pull(variable)
+used_vars <- bind_cols(used_vars, race_head_vars_6819 = race_head_vars_6819)
+head_race_6819 <- var_fam_fct(variables = race_head_vars_6819, name = "race_head")
+# ----
+
+# spouse race 1985-2019 ----
+psid_vars %>% filter(var_id == 849) %>% count(text)
+race_spouse_vars_8519 <- psid_vars %>% filter(var_id == 849) %>% pull(variable)
+used_vars <- bind_cols(used_vars, race_spouse_vars_8519 = race_spouse_vars_8519)
+race_spouse_vars_8519 <- race_spouse_vars_8519[!is.na(race_spouse_vars_8519)]
+spouse_race_8519 <- var_fam_fct(variables = race_spouse_vars_8519, name = "race_spouse") %>% filter(year %in% 1985:2019)
+spouse_race_8519 %>% count(year, race_spouse)
+# ----
+
+# bind together ----
+parents_race <- bind_rows(head_race_6819,
+                          spouse_race_8519) |> 
+  arrange(itw_num, year)
+# ----
+
+# race each year ----
+parents_race_long <- bind_rows(parents_sample_long %>%
+                                 select(ind_id_68, year, itw_num, rel_head) %>%
+                                 filter(substr(as.character(rel_head), 1, 1) == 1) %>%
+                                 left_join(parents_race %>% rename(race = race_head) %>% select(-race_spouse)),
+                               parents_sample_long %>%
+                                 select(ind_id_68, year, itw_num, rel_head) %>%
+                                 filter(substr(as.character(rel_head), 1, 1) == 2) %>%
+                                 left_join(parents_race %>% rename(race = race_spouse) %>% select(-race_head)))
+# ----
+
+# keep most recent race ----
+parents_race <- parents_race_long %>% 
+  filter(!is.na(race) & !race %in% c(0, 9)) %>% 
+  group_by(ind_id_68) %>% 
+  slice_max(order_by = year) %>% 
+  ungroup()
+setDT(parents_race)
+parents_race[, .N, by = ind_id_68] %>% count(N)
+
+parents_race <- parents_race %>% 
+  mutate(race_lab = case_when(year %in% 1968:2019 & race == 1 ~ "white",
+                              year %in% 1968:2019 & race == 2 ~ "african american",
+                              year %in% 1985:2019 & race == 3 ~ "native american",
+                              (year %in% 1985:2003 & race == 4) | (year %in% 2005:2019 & race %in% 4:5) ~ "asian, pacific islander",
+                              (year %in% 1968:1984 & race %in% c(3,7)) | (year %in% 1985:1989 & race == 7) | (year %in% 1990:2003 & race %in% c(5,6,7)) | (year %in% 2005:2019 & race %in% c(5,6,7)) ~ "other",
+                              (year %in% 1968:1989 & race == 5) | (year %in% 1990:2003 & race == 8) | (year %in% 2005:2019 & race == 7) ~ "missing"))
+parents_race %>% count(race_lab, race, sort = T) %>% count_to_pct()
+# ----
+
+# merge with parents_sample_clean ----
+parents_sample_clean <- parents_sample_clean %>% 
+  left_join(parents_race %>% select(ind_id_68, race_year = year, race, race_lab))
+parents_sample_clean %>% count(race_lab) %>% count_to_pct() # missing 1%
+# ----
+```
+
+### State and region of residence
+
+*Region of residence:* defined as most common state of residence between 30 and 50.
+
+```{r}
+psid_vars %>% filter(var_id == 6857) %>% count(text)
+state_vars <- psid_vars %>% filter(var_id == 6857) %>% pull(variable)
+used_vars <- bind_cols(used_vars, parent_state_vars = state_vars)
+
+parents_location <- var_fam_fct(variables = state_vars, name = "state")
+
+parents_location <- parents_sample_long %>% select(ind_id_68, age, year, itw_num) %>% 
+  left_join(parents_location)
+
+parents_location %>% count(state)
+parents_location %>% count(is.na(state)) %>% count_to_pct()
+parents_location %>% count(state %in% c(0, 99)) %>% count_to_pct()
+
+# select most common state/region of residence between ages 30 and 50
+parents_location <- parents_location %>% 
+  filter(!is.na(state) & !state %in% c(0,99) & age %in% 30:50) %>% 
+  group_by(ind_id_68, state) %>%
+  summarise(n_obs = n()) %>%
+  slice_max(order_by = n_obs) %>% 
+  ungroup()
+  
+setDT(parents_location)
+parents_location[, .N, by = ind_id_68] %>% count(N)
+# some parents are observed equally long in two different states, pick at random
+parents_location[, id := 1:.N, by = ind_id_68]
+parents_location <- parents_location[id == 1]
+parents_location[, .N, by = ind_id_68] %>% count(N)
+parents_location <- parents_location %>% select(-id)
+parents_location %>% count(state)
+
+parents_sample_clean <- parents_sample_clean %>% 
+  left_join(parents_location %>% select(ind_id_68, state))
+parents_sample_clean %>% count(is.na(state)) %>% count_to_pct() # missing 5%
+```
+
+## Children's characteristics
+
+### State/region when growing up
+
+*Region growing up:* defined as most common state/region between ages 0 and 18.
+
+```{r}
+psid_vars %>% filter(var_id == 6857) %>% count(text)
+state_vars <- psid_vars %>% filter(var_id == 6857) %>% pull(variable)
+used_vars <- bind_cols(used_vars, child_state_vars = state_vars)
+
+child_location <- var_fam_fct(variables = state_vars, name = "state")
+
+child_location <- child_sample_long %>% select(ind_id_68, birth_year, year, age, itw_num) %>%
+  left_join(child_location)
+
+child_location %>% count(state)
+child_location %>% count(is.na(state)) %>% count_to_pct()
+
+child_location %>% count(age)
+
+# select most common state/region of residence between ages 0 and 18
+child_location <- child_location %>% 
+  filter(!is.na(state) & !state %in% c(0, 99) & age %in% 0:18) %>% 
+  group_by(ind_id_68, state) %>%
+  summarise(n_obs = n()) %>% 
+  slice_max(order_by = n_obs) %>%
+  ungroup()
+setDT(child_location)
+child_location[, .N, by = ind_id_68] %>% count(N)
+# some children are observed with equal likelihood in different states, pick at random
+child_location[, id := 1:.N, by = ind_id_68]
+child_location <- child_location[id == 1]
+child_location %>% count(state) 
+
+child_sample_clean <- child_sample_clean %>% left_join(child_location %>% select(ind_id_68, state))
+child_sample_clean %>% count(state)
+# missing state for 3.3% of children
+child_sample_clean %>% count(is.na(state)) %>% count_to_pct()
+```
+
+## Child income
+
+*Baseline definition:* average family total income (incl. transfers) between ages 30 and 50.\
+$\rightarrow$ missing for 3% of children
+
+```{r}
+child_sample_clean %>% names
+
+child_sample_clean <- child_sample_clean %>% 
+  left_join(inc_fct(dt = child_sample_long,
+                    inc_var = "family total income",
+                    age_range = 30:50))
+
+# replace number of income observations NAs by 0
+child_sample_clean <- child_sample_clean %>% 
+  mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .)))
+
+# count number of income observations
+child_sample_clean %>% 
+  summarise(across(starts_with("n_"), ~ mean(. == 0)))
+
+# % of no income obs by birth year
+child_sample_clean %>%
+  group_by(birth_year) %>% 
+  summarise(missing_3050 = mean(n_family_total_income_real_3050 == 0)) %>% 
+  ggplot(aes(x = birth_year, y = missing_3050)) +
+  geom_col() +
+  labs(x = "Birth year",
+       y = "% no income obs. 30-50") +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(lim = c(0, .5), expand = c(0,0), labels = scales::percent)
+
+# graph of number of child income observations
+pct_n_inc <- child_sample_clean %>% count(n_family_total_income_real_3050) %>% count_to_pct()
+
+child_sample_clean %>%
+  group_by(birth_year, n_family_total_income_real_3050) %>% 
+  summarise(n_obs = n()) %>% 
+  left_join(pct_n_inc) %>% 
+  mutate(n_family_inc_with_pct = paste0(n_family_total_income_real_3050, " (", round(pct*100,1), "%)")) %>% 
+  ggplot(aes(x = birth_year, y = n_obs, fill = fct_reorder(n_family_inc_with_pct, n_family_total_income_real_3050))) +
+  geom_col(position = "fill") +
+  scale_fill_viridis_d() +
+  scale_x_continuous(lim = c(1962, 1989), breaks = seq(1960, 1995, 5), expand = c(0,0)) +
+  scale_y_continuous(breaks = seq(0, 1, .2), labels = scales::percent, expand = c(0,0)) +
+  labs(x = "birth year",
+       y = "number of family total income observations",
+       fill = "number of obs.",
+       caption = "Sample: 1983-1988 cohorts, child taxable family income.") +
+  guides(fill = guide_legend(ncol = 1))
+
+# by gender
+child_sample_clean %>%
+  group_by(birth_year, gender, n_family_total_income_real_3050) %>% 
+  summarise(n_obs = n()) %>% 
+  left_join(pct_n_inc) %>% 
+  mutate(n_family_inc_with_pct = paste0(n_family_total_income_real_3050, " (", round(pct*100,1), "%)")) %>% 
+  ggplot(aes(x = birth_year, y = n_obs, fill = fct_reorder(n_family_inc_with_pct, n_family_total_income_real_3050))) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_wrap(vars(gender)) +
+  scale_fill_viridis_d() +
+  scale_x_continuous(lim = c(1962, 1989), breaks = seq(1960, 1995, 5), expand = c(0,0)) +
+  scale_y_continuous(breaks = seq(0, 1, .2), labels = scales::percent, expand = c(0,0)) +
+  labs(x = "birth year",
+       y = "number of family total income observations",
+       fill = "number of obs.",
+       caption = "Sample: 1963-1988 cohorts, child taxable family income.") +
+  guides(fill = guide_legend(ncol = 1))
+```
+
+## Parent income
+
+5.6% of parents have no labor income observations between 30 and 50. (Is this expected?) Much more common for fathers (8.3%) than for mothers (3.4%)... How come? 48% are from the original sample...
+
+```{r}
+# use function to obtain parents' labor incomes between 30 and 50
+parents_sample_clean <- parents_sample_clean %>% 
+  left_join(inc_fct(dt = parents_sample_long,
+                    inc_var = "labor income",
+                    age_range = 30:50))
+
+# replace number of income observations NAs by 0
+parents_sample_clean <- parents_sample_clean %>% 
+  mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .)))
+
+# count number of income observations
+# 5.6% of no labor income observations between 30 and 50 
+parents_sample_clean %>% 
+  summarise(across(starts_with("n_"), ~ mean(. == 0)))
+
+# more common for fathers... 8.3% (not sure why that is?)
+parents_sample_clean %>% group_by(gender) %>% summarise(across(starts_with("n_"), ~ mean(. == 0)))
+
+parents_sample_clean[n_labor_income_real_3050 == 0] %>% count(sample_status, sort = T) %>% count_to_pct()
+```
+
+## Display and export used variables
+
+```{r}
+used_vars
+fwrite(used_vars, here("data/used_vars_variables.csv"))
+```
+
+## Export intermediate datasets
+
+```{r}
+fwrite(parents_sample_clean, here("data/parents_sample_clean_results.csv"))
+fwrite(child_sample_clean, here("data/child_sample_clean_results.csv"))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

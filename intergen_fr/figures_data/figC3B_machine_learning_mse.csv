@@ -1,0 +1,9 @@
+n,method,order_method,group,mse
+14735,Baseline,1,Female,0.528896766784239
+14735,GAM,2,Female,0.527929353746071
+14735,Boosted tree,3,Female,0.5571124870033
+14735,Ensemble method,4,Female,0.523387595504071
+15583,Baseline,1,Males,0.27433493258284
+15583,GAM,2,Males,0.273055975215321
+15583,Boosted tree,3,Males,0.287363370004806
+15583,Ensemble method,4,Males,0.2701282321762

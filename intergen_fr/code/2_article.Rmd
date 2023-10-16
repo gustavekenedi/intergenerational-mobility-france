@@ -1,0 +1,3197 @@
+---
+title: "Article"
+author: "Gustave Kenedi & Louis Sirugue"
+date: "04/01/2023"
+output: 
+  html_document:
+    toc: true
+    theme: cosmo
+editor_options: 
+  chunk_output_type: console
+---
+    
+# Setup
+
+```{r, message = F}
+Sys.time()
+# RStudio version 1.4.1717
+# R version 4.2.2 (2022-10-31 ucrt)
+# Platform: x86_64-w64-mingw32/x64 (64-bit)
+
+# Packages
+library(sf)           # Version 1.0.9
+library(knitr)        # Version 1.41
+library(plot3D)       # Version 1.4
+library(stargazer)    # Version 5.2.3
+library(tidyverse)    # Version 1.3.2
+library(data.table)   # Version 1.14.6
+library(SuperLearner) # Version 2.0.28
+library(ggalluvial)   # Version 0.12.3
+library(xgboost)      # Version 1.6.0.1
+library(glmnet)       # Version 4.1.6
+library(gam)          # Version 1.22
+
+# Chunk options
+opts_chunk$set(message = F, warning = F)
+
+# Fix randomness
+set.seed(1)
+
+# Paths
+prj_dir <- "C:/Users/Public/Documents/gustave_k/intergen_income_mob/jpube/revision/"
+
+# Clean datasets
+children <- fread(paste0(prj_dir, "data/children.csv"), na.strings = "")
+syn_parents <- fread(paste0(prj_dir, "data/syn_parents.csv"), na.strings = "")
+dep_shp <- read_sf(paste0(prj_dir, "data/dep.shp"))
+```
+
+# Sample construction
+
+## Children sample construction
+
+```{r table_F1}
+# First restriction: born in France
+table_F1 <- children[, .(born_france = .N), by = birth_year] %>%
+  # Second restriction: observed with parents
+  merge.data.table(children[family_link == 3, 
+                            .(with_parents = .N), by = birth_year]) %>%
+  # Third restriction: Observed in tax data
+  merge.data.table(children[family_link == 3 & !is.na(avg_ysali_real_2010_16) & !is.na(avg_revtotnonpsocm_real_2010_16), 
+                            .(in_tax_data = .N), by = birth_year]) %>%
+  # Fourth restriction: at age 35-45
+  merge.data.table(children[family_link == 3 & !is.na(avg_ysali_real_2010_16_3545) & !is.na(avg_revtotnonpsocm_real_2010_16_3545), 
+                            .(at_35_45 = .N), by = birth_year]) %>%
+  # Fifth restriction: parents occupation neither 1x nor 31
+  merge.data.table(children[family_link == 3 & !is.na(avg_ysali_real_2010_16_3545) & !is.na(avg_revtotnonpsocm_real_2010_16_3545) & 
+                              ((mother_cs2_90 > 20 & mother_cs2_90 != 31 | is.na(mother_cs2_90)) &
+                                 (father_cs2_90 > 20 & father_cs2_90 != 31 | is.na(father_cs2_90))), 
+                            .(not_1_31 = .N), by = birth_year])
+
+# Compute total at each restriction
+table_F1 <- rbind(copy(table_F1)[, birth_year := as.character(birth_year)],
+      table_F1[, lapply(.SD, sum)][, birth_year := "Total"])
+
+table_F1
+fwrite(table_F1, paste0(prj_dir, "out/tab/tabF1_child_sample_construc.csv"))
+
+# Among individuals born in France in 1972-1981 who are observed in the 1990 census:
+in_text_figures <- children %>% 
+  # Percentage with at least one parent farmer
+  .[family_link == 3, 
+    .(Label = "farmer parent",
+      Figure = mean(mother_cs2_90 < 20 | father_cs2_90 < 20, na.rm = T),
+      N = .N)] %>%
+  # Percentage with at least one parent liberal
+  rbind(children %>% 
+          .[family_link == 3, 
+            .(Label = "liberal parent",
+              Figure = mean(mother_cs2_90 == 31 | father_cs2_90 == 31, na.rm = T),
+              N = .N)])
+```
+
+
+## Parents sample construction
+
+```{r table_F4}
+# Number of observations by gender
+table_F4 <- distinct(syn_parents)[, .(metrop = .N), by = "gender"] %>%
+  # If observed in the 1990 census
+  merge.data.table(distinct(syn_parents) %>%
+                     .[nobs_RP90 > 0, ] %>%
+                     .[, .(census_90 = .N), by = "gender"]) %>%
+  # And if born in an even year
+  merge.data.table(distinct(syn_parents) %>%
+                     .[nobs_RP90 > 0 & birth_year %% 2 == 0, ] %>%
+                     .[, .(even_year = .N), by = "gender"] ) %>%
+  # And if at least 2 income observations
+  merge.data.table(distinct(syn_parents) %>%
+                     .[nobs_RP90 > 0 & birth_year %% 2 == 0 
+                       & n_netinc_3545 >= 2, ] %>%
+                     .[, .(two_obs = .N), by = "gender"]) %>%
+  # And if not in occupation 1x nor 31
+  merge.data.table(distinct(syn_parents) %>%
+                     .[nobs_RP90 > 0 & birth_year %% 2 == 0 & 
+                         n_netinc_3545 >= 2 & !cs2_90 %in% c(11:13, 31), ] %>%
+                     .[, .(occupation = .N), by = "gender"])
+
+table_F4 <- rbind(copy(table_F4)[, gender := ifelse(gender == "F", "Female", "Male")],
+                  table_F4[, lapply(.SD, sum), .SDcols = names(table_F4)[-1]] %>%
+                    .[, gender := "Total"]) 
+
+table_F4
+fwrite(table_F4, paste0(prj_dir, "out/tab/tabF4_syn_parents_sample_const.csv"))
+```
+
+## Balancing test
+
+```{r table_F2_F3}
+# Continuous covariates
+contcov = c("gender", "age_90", "born_french", 
+            paste0(c("unemp", "foreign", "single", "density", "pop"), "_mun"))
+# Discrete covariates
+discov = c("cbirth", "edu_90", "cs2_90", "type_fam", "cs1_90")
+# All covariates
+instru_set <- c(contcov, discov)
+
+syn_table <- copy(syn_parents) %>%
+  # Aggregate occuption to 1-digit classification and convert gender to dummy
+  .[, ":=" (cs1_90 = floor(cs2_90/10),
+            gender = as.numeric(gender == "F"))] %>%
+  # Keep only synthetic parents with no missing instrument
+  .[, .SD, .SDcols = instru_set] %>% na.omit()
+
+# Same for actual mothers and fathers
+chl_fathers <- children %>%
+  .[family_link == 3, ] %>%
+  .[, gender := 0] %>% 
+  .[, .SD, .SDcols = c(names(children)[names(children) %in% instru_set | 
+                                         grepl("^father_", names(children))])] %>%
+  na.omit()
+
+chl_mothers <- children %>%
+  .[family_link == 3, ] %>%
+  .[, gender := 1] %>% 
+  .[, .SD, .SDcols = c(names(children)[names(children) %in% instru_set | 
+                                         grepl("^mother_", names(children))])]  %>%
+  na.omit()
+
+names(chl_fathers) <- sub("^father_", "", names(chl_fathers))
+names(chl_mothers) <- sub("^mother_", "", names(chl_mothers))
+
+chl_parents <- rbind(chl_mothers, chl_fathers) %>%
+  .[, ":=" (cs1_90 = floor(cs2_90/10),
+            gender = as.numeric(gender == "1"))]
+
+# Transform categorical variables into dummies
+for (i in discov) {
+  for (j in sort(unique(syn_table[[i]]))) {
+    syn_table[, (paste(i, j, sep = "_")) := lapply(.SD, function(x) {as.numeric(x == j)}), .SDcols = i]
+    chl_parents[, (paste(i, j, sep = "_")) := lapply(.SD, function(x) {as.numeric(x == j)}), .SDcols = i]
+  }
+}
+
+# Full balance table
+table_F2_F3 <- syn_table[, (discov) := NULL][, ":=" (N = .N, sample = "Synthetic")] %>%
+  rbind(chl_parents[, (discov) := NULL][, ":=" (sample = "Actual", N = .N)]) %>%
+  .[, lapply(.SD, mean), by = "sample", 
+    .SDcols = names(syn_table)[names(syn_table) != "sample"]] %>%
+  pivot_longer(-sample, names_to = "Variable", values_to = "Mean") %>%
+  mutate(Mean = ifelse(Variable %in% c("age_90", "density_mun", "pop_mun", "N"), 
+                       Mean, 100 * Mean)) %>%
+  pivot_wider(names_from = "sample", values_from = "Mean")
+
+# Save table F2
+table_F2 <- table_F2_F3[!grepl("^cs2", table_F2_F3$Variable), ]
+table_F2
+fwrite(table_F2_F3[!grepl("^cs2", table_F2_F3$Variable), ],
+       paste0(prj_dir, "out/tab/tabF2_actual_synthetic.csv"))
+
+# Save table F3
+table_F3 <- table_F2_F3[grepl("^cs2.*$|^N$", table_F2_F3$Variable), ]
+table_F3
+fwrite(table_F2_F3[grepl("^cs2.*$|^N$", table_F2_F3$Variable), ],
+       paste0(prj_dir, "out/tab/tabF3_actual_synthetic_cs2.csv"))
+```
+
+# Predictions
+
+```{r}
+# Synthetic parents selection
+syn_parents_FS <- copy(syn_parents) %>%
+  # Keep individuals born in an even year, with positive average income computed
+  # over at least 2 income observations
+  .[birth_year %% 2 == 0 & avg_netinc_3545 > 0 & n_netinc_3545 >= 2, ] %>%
+  # Recode log income, gender, and occupation variables
+  .[, ":=" (ln_parents_income_var = log(avg_netinc_3545),
+            gender = as.numeric(gender == "F"))] %>%
+  .[cs2_90 %in% c(11:13, 31), cs2_90 := NA] %>%
+  # Keep identifier, log income, and predictors
+  .[, .SD, .SDcols = c("ID_DIFF", "ln_parents_income_var", "gender", "age_90", 
+                       "born_french", "unemp_mun", "foreign_mun", "single_mun", 
+                       "density_mun", "pop_mun", "cbirth", "edu_90", "cs2_90", 
+                       "type_fam")] %>%
+  # Drop individuals with missing values and duplicates
+  na.omit() %>% distinct()
+
+# One hot encode discrete variables
+syn_encoded <- copy(syn_parents_FS)
+for (i in c("cbirth", "edu_90", "cs2_90", "type_fam")) {
+  for (j in sort(unique(syn_encoded[[i]]))[-1]) {
+    syn_encoded[, (paste(i, j, sep = "_")) := lapply(.SD, function(x) {as.numeric(x == j)}), .SDcols = i]
+  }
+}
+
+# Remove discrete variables
+syn_encoded[, (c("cbirth", "edu_90", "cs2_90", "type_fam")) := NULL]
+
+# One hot encoded variables
+bin_list <- names(syn_encoded)[!names(syn_encoded) %in% 
+                                 c("ID_DIFF", "gender", "ln_parents_income_var")]
+
+# Create folds
+syn_encoded <- syn_encoded %>%
+  # Sort individuals randomly
+  .[order(gender, runif(.N, 0, 1)), ] %>%
+  # Divide into 5 folds
+  .[, fold := ceiling(5 * (1:.N / .N)), by = gender]
+
+# Predict
+for (x in 1:5) {
+  for (y in 0:1) {
+    syn_encoded[gender == y & fold == x, pred := predict(
+      lm(paste("ln_parents_income_var ~", paste0("`", bin_list, "`", collapse = "+")), 
+         syn_encoded[gender == y & fold != x]), newdata = syn_encoded[gender == y & fold == x])]
+  }
+}
+
+# MSE by department
+dep_mse <- merge.data.table(syn_encoded[, .(ID_DIFF, gender, ln_parents_income_var, pred)],
+                            distinct(syn_parents[, .(ID_DIFF, gender = as.numeric(gender == "F"), dep)]), 
+                            all.x = T, by = c("ID_DIFF", "gender")) %>%
+  .[, .(mse = mean((pred - ln_parents_income_var)^2)), by = dep]
+```
+
+## Out-of-sample CEF
+
+```{r}
+syn_encoded <- syn_encoded %>%
+  # Rank according to observed income
+  .[order(ln_parents_income_var), ] %>% 
+  .[, observed_rank := ceiling(100 * (1:.N / .N))] %>%
+  .[, observed_rank := ceiling(median(observed_rank)), by = ln_parents_income_var] %>%
+  # Rank according to predicted income
+  .[order(pred), ] %>% 
+  .[, predicted_rank := ceiling(100 * (1:.N / .N))] %>%
+  .[, predicted_rank := ceiling(median(predicted_rank)), by = ln_parents_income_var] 
+
+out_of_sample_cef <- copy(syn_encoded) %>%
+  .[, .(n = .N, 
+        observed_log_income = mean(ln_parents_income_var),
+        predicted_log_income = mean(pred),
+        predicted_log_income_Q1 = quantile(pred, .25),
+        predicted_log_income_Q3 = quantile(pred, .75), 
+        predicted_rank = mean(predicted_rank),
+        predicted_rank_Q1 = quantile(predicted_rank, .25),
+        predicted_rank_Q3 = quantile(predicted_rank, .75)), 
+    by = observed_rank] %>% 
+  .[order(n), .(n, observed_rank, predicted_rank_Q1, predicted_rank, 
+                predicted_rank_Q3, observed_log_income, predicted_log_income_Q1, 
+                predicted_log_income, predicted_log_income_Q3)]
+
+fwrite(out_of_sample_cef, paste0(prj_dir, "out/fig/out_of_sample_cef.csv"))
+
+out_of_sample_cef %>%
+  mutate(id = row_number()) %>%
+  pivot_longer(-c(id, n)) %>%
+  mutate(q = case_when(!grepl("Q[0-9]", name) ~ "predicted",
+                       grepl("Q1", name) ~ "Q1",
+                       grepl("Q3", name) ~ "Q3")) %>%
+  separate(name, c("observed", "income"), "\\_") %>% 
+  pivot_wider(names_from = "observed", values_from = "value") %>% 
+  group_by(id, income) %>%
+  mutate(observed = max(observed, na.rm = T)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = "q", values_from = "predicted") %>% 
+  ggplot() +
+  geom_point(aes(x = observed, y = predicted)) + 
+  geom_line(aes(x = observed, y = observed)) +
+  geom_ribbon(aes(x = observed, ymin = Q1, ymax = Q3), alpha = .3) +
+  facet_wrap(~income, nrow = 1, scales = "free") +
+  ggtitle("Q1--Mean--Q3")
+
+ggsave(paste0(prj_dir, "out/fig/out_of_sample_cef.png"))
+
+out_of_sample_cef_gender <- copy(syn_encoded) %>%
+  # Rank according to observed income
+  .[order(gender, ln_parents_income_var), ] %>% 
+  .[, observed_rank := ceiling(100 * (1:.N / .N)), by = "gender"] %>%
+  .[, observed_rank := ceiling(median(observed_rank)), by = c("gender", "ln_parents_income_var")] %>%
+  # Rank according to predicted income
+  .[order(gender, pred), ] %>% 
+  .[, predicted_rank := ceiling(100 * (1:.N / .N)), by = "gender"] %>%
+  .[, predicted_rank := ceiling(median(predicted_rank)), by = c("gender", "ln_parents_income_var")]  %>%
+  .[, .(n = .N, 
+        observed_log_income = mean(ln_parents_income_var),
+        predicted_log_income = mean(pred),
+        predicted_log_income_Q1 = quantile(pred, .25),
+        predicted_log_income_Q3 = quantile(pred, .75), 
+        predicted_rank = mean(predicted_rank),
+        predicted_rank_Q1 = quantile(predicted_rank, .25),
+        predicted_rank_Q3 = quantile(predicted_rank, .75)), 
+    by = c("gender", "observed_rank")] %>% 
+  .[order(n), .(n, gender, observed_rank, predicted_rank_Q1, predicted_rank, 
+                predicted_rank_Q3, observed_log_income, predicted_log_income_Q1, 
+                predicted_log_income, predicted_log_income_Q3)]
+
+fwrite(out_of_sample_cef_gender, paste0(prj_dir, "out/fig/out_of_sample_cef_gender.csv"))
+
+out_of_sample_cef_gender %>%
+  mutate(id = row_number()) %>%
+  pivot_longer(-c(id, n, gender)) %>%
+  mutate(q = case_when(!grepl("Q[0-9]", name) ~ "predicted",
+                       grepl("Q1", name) ~ "Q1",
+                       grepl("Q3", name) ~ "Q3")) %>%
+  separate(name, c("observed", "income"), "\\_") %>% 
+  pivot_wider(names_from = "observed", values_from = "value") %>% 
+  group_by(id, income) %>%
+  mutate(observed = max(observed, na.rm = T)) %>%
+  ungroup() %>%
+  pivot_wider(names_from = "q", values_from = "predicted") %>% 
+  ggplot() +
+  geom_point(aes(x = observed, y = predicted)) + 
+  geom_line(aes(x = observed, y = observed)) +
+  geom_ribbon(aes(x = observed, ymin = Q1, ymax = Q3), alpha = .3) +
+  facet_wrap(income~gender, scales = "free") +
+  ggtitle("Q1--Mean--Q3")
+
+ggsave(paste0(prj_dir, "out/fig/out_of_sample_cef_gender.png"))
+
+```
+
+## Out-of-sample quintiles
+
+```{r}
+out_of_sample_quintiles <- copy(syn_encoded) %>% .[, ":=" (
+  observed_quintile = as.numeric(cut(as.numeric(observed_rank), 
+                          breaks = seq(0, 100, 20), na.rm = TRUE)),
+  predicted_quintile = as.numeric(cut(as.numeric(predicted_rank), 
+                           breaks = seq(0, 100, 20), na.rm = TRUE)))] %>%
+  .[, n_bar := .N, by = observed_quintile] %>%
+  .[, .(n = .N, share = .N/unique(n_bar)), 
+    by = c("observed_quintile", "predicted_quintile")] %>%
+  .[, label := paste0(round(100 * share, 1), "%")] %>%
+  .[order(n), .(n, observed_quintile, predicted_quintile, share, label)]
+
+fwrite(out_of_sample_quintiles, paste0(prj_dir, "out/fig/out_of_sample_quintiles.csv"))
+
+ggplot(out_of_sample_quintiles, 
+       aes(x = observed_quintile, y = share, fill = factor(-predicted_quintile), label = label)) +
+  geom_bar(position = "fill", stat = "identity", width = .99) +
+  geom_text(position = position_stack(vjust = .5), color = "white") 
+
+ggsave(paste0(prj_dir, "out/fig/out_of_sample_quintiles.png"))
+
+
+out_of_sample_quintiles_gender <- copy(syn_encoded)  %>%
+  # Rank WITHIN GENDER according to observed income
+  .[order(gender, ln_parents_income_var), ] %>% 
+  .[, observed_rank := ceiling(100 * (1:.N / .N)), by = gender] %>%
+  .[, observed_rank := ceiling(median(observed_rank)), 
+    by = c("ln_parents_income_var", "gender")] %>%
+  # Rank according to predicted income
+  .[order(gender, pred), ] %>% 
+  .[, predicted_rank := ceiling(100 * (1:.N / .N)), by = gender] %>%
+  .[, predicted_rank := ceiling(median(predicted_rank)), 
+    by = c("ln_parents_income_var", "gender")] %>% 
+  .[, ":=" (
+  observed_quintile = as.numeric(cut(as.numeric(observed_rank), 
+                          breaks = seq(0, 100, 20), na.rm = TRUE)),
+  predicted_quintile = as.numeric(cut(as.numeric(predicted_rank), 
+                           breaks = seq(0, 100, 20), na.rm = TRUE)))] %>%
+  .[, n_bar := .N, by = c("observed_quintile", "gender")] %>%
+  .[, .(n = .N, share = .N/unique(n_bar)), 
+    by = c("observed_quintile", "predicted_quintile", "gender")] %>%
+  .[, label := paste0(round(100 * share, 1), "%")] %>%
+  .[order(n), .(n, gender, observed_quintile, predicted_quintile, share, label)]
+
+fwrite(out_of_sample_quintiles_gender, paste0(prj_dir, "out/fig/out_of_sample_quintiles_gender.csv"))
+
+ggplot(out_of_sample_quintiles_gender, 
+       aes(x = observed_quintile, y = share, fill = factor(-predicted_quintile), label = label)) +
+  geom_bar(position = "fill", stat = "identity", width = .99) +
+  geom_text(position = position_stack(vjust = .5), color = "white") +
+  facet_wrap(~gender, nrow = 1)
+
+ggsave(paste0(prj_dir, "out/fig/out_of_sample_quintiles_gender.png"))
+```
+
+## MSE sensitivity to trimming
+
+```{r figE1}
+syn_encoded[, c("pred", "observed_rank", "predicted_rank") := NULL]
+
+# Generate every trimming combinations
+trim <- data.table(trim_bottom = c(seq(0, 2, .1), rep(0, 21)),
+                   trim_top = c(rep(0, 21), seq(0, 2, .1)),
+                   tail = rep(c("Bottom", "Top"), each = 21))
+
+figE1 <- lapply(1:nrow(trim), function(x) {
+  
+  for (fold_i in 1:5) {
+    
+    # Generate train data
+    train_data <- syn_encoded[fold != fold_i] %>%
+      # Sort by gender income
+      .[order(gender, ln_parents_income_var), ] %>%
+      # Generate percentile ranks within gender
+      .[, rank := 100 * (1:.N / .N), by = gender] %>%
+      # Trim tails
+      .[rank > trim$trim_bottom[x] & rank < (100 - trim$trim_top[x]), ]
+    
+    # Train on 4 folds without the top/bottom x%
+    mother_fstage <- lm(paste("ln_parents_income_var ~", 
+                              paste0("`", bin_list, "`", collapse = "+")), 
+                        train_data[gender == 1])
+    
+    father_fstage <- lm(paste("ln_parents_income_var ~", 
+                              paste0("`", bin_list, "`", collapse = "+")), 
+                        train_data[gender == 0])
+    
+    # Test on the remaining fold
+    syn_encoded[gender == 1 & fold == fold_i, 
+                pred := predict(mother_fstage, newdata = syn_encoded %>% 
+                                  .[gender == 1 & fold == fold_i])]
+    
+    syn_encoded[gender == 0 & fold == fold_i, 
+                pred := predict(father_fstage, newdata = syn_encoded %>% 
+                                  .[gender == 0 & fold == fold_i])]
+  }
+  
+  # Compute the mean squared error
+  return(trim[x, ][, ":=" (
+    male = syn_encoded[gender == 0, .(MSE = mean((pred - ln_parents_income_var)^2))]$MSE,
+    female = syn_encoded[gender == 1, .(MSE = mean((pred - ln_parents_income_var)^2))]$MSE)])
+  
+}) %>% rbindlist()
+
+figE1 <- figE1 %>%
+  .[, trim := ifelse(tail == "Top", trim_top, trim_bottom)] %>%
+  pivot_longer(c(male, female), names_to = "gender", values_to = "MSE") %>%
+  mutate(n = ifelse(gender == "male", nrow(syn_encoded[gender == 0]), 
+                                           nrow(syn_encoded[gender == 1]))) %>%
+  select(n, gender, tail, trim, MSE) %>% arrange(n)
+
+fwrite(figE1, paste0(prj_dir, "out/fig/figE1_MSE_trimming.csv"))
+
+ggplot(figE1, aes(x = trim, y = MSE, color = tail)) +
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x, 2)) + 
+  facet_wrap(~gender, scales = "free_y", nrow = 2)
+
+ggsave(paste0(prj_dir, "out/fig/figE1_MSE_trimming.png"))
+
+# Remove temp variables
+syn_encoded[, (c("fold", "pred")) := NULL]
+```
+
+## Machine Learning first stage
+
+```{r}
+Sys.time()
+# Remove spaces and parentheses in variable names
+names(syn_encoded) <- gsub(" |\\(|\\)", "_", names(syn_encoded))
+
+ml_results <- lapply(list("SL.lm", "SL.gam", "SL.xgboost", 
+                          c("SL.lm", "SL.gam", "SL.xgboost")), function(x) {
+  
+  lapply(0:1, function(y) {
+    SuperLearner(Y = syn_encoded[gender == y, ]$ln_parents_income_var, 
+                 X = syn_encoded[gender == y, ] %>% 
+                   .[, ":=" (ID_DIFF = NULL, ln_parents_income_var = NULL, gender = NULL)], 
+                 family = gaussian(), SL.library = x, cvControl = list(V = 5))
+  })
+  
+})
+
+cv_results <- lapply(0:1, function(y) {
+  CV.SuperLearner(Y = syn_encoded[gender == y, ]$ln_parents_income_var, 
+                  X = syn_encoded[gender == y, ] %>% 
+                    .[, ":=" (ID_DIFF = NULL, ln_parents_income_var = NULL, gender = NULL)],
+                  family = gaussian(), SL.library = c("SL.lm", "SL.gam", "SL.xgboost"),
+                  cvControl = list(V = 5))
+})
+Sys.time()
+
+# For males
+summary(cv_results[[1]])$Table
+# For females
+summary(cv_results[[2]])$Table
+```
+
+## First stage function
+
+```{r}
+first_stage <- function(
+  # Binary and continuous instruments
+  numeric_instru = c("gender", "age_90", "born_french", "unemp_mun", 
+                     "foreign_mun", "single_mun", "density_mun", "pop_mun"),
+  # Categorical instruments
+  factor_instru = c("cbirth", "edu_90", "cs2_90", "type_fam"),
+  # Parent income variable to predict
+  parents_inc = "avg_netinc_3545",
+  # Bottom and top trimming
+  remove_bottom = 0,
+  remove_top = 0,
+  # Minimum number of income observations
+  min_inc_obs_var = "n_netinc_3545",
+  min_inc_obs = 2) {
+  
+  # Synthetic parents selection
+  syn_parents_FS <- copy(syn_parents) %>%
+    # Keep individuals born in an even year, with positive average income computed
+    # over at least 2 income observations
+    .[birth_year %% 2 == 0 & get(parents_inc) > 0 & 
+        get(min_inc_obs_var) >= min_inc_obs, ] %>%
+    # Recode log income, gender, and occupation variables
+    .[, ":=" (ln_parents_income_var = log(get(parents_inc)),
+              gender = as.numeric(gender == "F"))] %>%
+    .[cs2_90 %in% c(11:13, 31), cs2_90 := NA] %>%
+    # Keep identifier, log income, and predictors
+    .[, .SD, .SDcols = c("ID_DIFF", "ln_parents_income_var", numeric_instru, factor_instru)] %>%
+    # Drop individuals with missing values and duplicates
+    na.omit() %>% distinct()
+  
+  # Same on actual mothers and fathers
+  chl_fathers <- children[family_link == 3, ] %>%
+    .[father_cs2_90 %in% c(11:13, 31), father_cs2_90 := NA] %>%
+    .[, gender := 0] %>% 
+    .[, .SD, .SDcols = c("ID_DIFF", names(children)[names(children) %in% c(numeric_instru, factor_instru, 
+                                                                           paste0("father_", c(numeric_instru, factor_instru)))])] 
+  
+  chl_mothers <- children[family_link == 3, ] %>%
+    .[mother_cs2_90 %in% c(11:13, 31), mother_cs2_90 := NA] %>%
+    .[, gender := 1] %>% 
+    .[, .SD, .SDcols = c("ID_DIFF", names(children)[names(children) %in% c(numeric_instru, factor_instru, 
+                                                                           paste0("mother_", c(numeric_instru, factor_instru)))])] 
+  
+  names(chl_fathers) <- sub("^father_", "", names(chl_fathers))
+  names(chl_mothers) <- sub("^mother_", "", names(chl_mothers))
+  
+  for (i in factor_instru) {
+    chl_fathers <- chl_fathers[get(i) %in% unique(syn_parents_FS[gender == 0, get(i)]), ]
+    chl_mothers <- chl_mothers[get(i) %in% unique(syn_parents_FS[gender == 1, get(i)]), ]
+  }
+  
+  chl_encoded <- rbind(chl_mothers, chl_fathers)
+  
+  # One hot encode discrete variables
+  syn_encoded <- copy(syn_parents_FS)
+  for (i in factor_instru) {
+    # Synthetic parents 
+    for (j in sort(unique(syn_encoded[[i]]))[-1]) {
+      syn_encoded[, (paste(i, j, sep = "_")) := lapply(.SD, function(x) {as.numeric(x == j)}), .SDcols = i]
+    }
+    # Actual parents
+    for (j in sort(unique(chl_encoded[[i]]))[-1]) {
+      chl_encoded[, (paste(i, j, sep = "_")) := lapply(.SD, function(x) {as.numeric(x == j)}), .SDcols = i]
+    }
+  }
+  
+  # Remove discrete variables
+  syn_encoded[, (factor_instru) := NULL]
+  chl_encoded[, (factor_instru) := NULL]
+  
+  # One hot encoded variables
+  bin_list <- names(syn_encoded)[!names(syn_encoded) %in% 
+                                   c("ID_DIFF", "gender", "ln_parents_income_var")]
+  
+  
+  mother_fstage_dt <- syn_encoded[gender == 1, ] %>%
+                        .[ln_parents_income_var >= quantile(ln_parents_income_var, remove_bottom, na.rm = TRUE) & 
+                            ln_parents_income_var <= quantile(ln_parents_income_var, 1 - remove_top, na.rm = TRUE)]
+  # Prediction models by gender
+  mother_fstage <- lm(paste("ln_parents_income_var ~", paste0("`", bin_list, "`", collapse = "+")), 
+                      mother_fstage_dt)
+  
+  father_fstage_dt <- syn_encoded[gender == 0, ] %>%
+                        .[ln_parents_income_var >= quantile(ln_parents_income_var, remove_bottom, na.rm = TRUE) & 
+                            ln_parents_income_var <= quantile(ln_parents_income_var, 1 - remove_top, na.rm = TRUE)]
+  
+  father_fstage <- lm(paste("ln_parents_income_var ~", paste0("`", bin_list, "`", collapse = "+")), 
+                      father_fstage_dt)
+  
+  pooled_fstage_dt <- syn_encoded %>%
+                        .[ln_parents_income_var >= quantile(ln_parents_income_var, remove_bottom, na.rm = TRUE) & 
+                            ln_parents_income_var <= quantile(ln_parents_income_var, 1 - remove_top, na.rm = TRUE)]
+    
+  pooled_fstage <- lm(paste("ln_parents_income_var ~ gender +", paste0("`", bin_list, "`", collapse = "+"), 
+                            "+", paste0("gender*`", bin_list, "`", collapse = "+")), pooled_fstage_dt)
+  
+  # Merge with mother and father predicted income
+  predictions <- chl_encoded %>%
+    .[gender == 1, .(ID_DIFF)] %>% 
+    # Mother predicted income
+    .[, mother_log_income := 
+        predict(mother_fstage, newdata = chl_encoded %>%
+                  .[gender == 1] %>%
+                  .[, ":=" (gender = NULL, ID_DIFF = NULL)])] %>%
+    merge.data.table(chl_encoded %>%
+                       .[gender == 0, .(ID_DIFF)] %>% 
+                       # Father predicted income
+                       .[, father_log_income := 
+                           predict(father_fstage, newdata = chl_encoded %>%
+                                     .[gender == 0] %>%
+                                     .[, ":=" (gender = NULL, ID_DIFF = NULL)])],
+                     by = "ID_DIFF", all.x = T, all.y = T)
+  
+  return(list(predictions, data.table(Label = c("Mother", "Father", "Pooled"),
+                                      Figure = c(summary(mother_fstage)$r.squared,
+                                                 summary(father_fstage)$r.squared,
+                                                 summary(pooled_fstage)$r.squared),
+                                      N = c(nrow(mother_fstage_dt), 
+                                            nrow(father_fstage_dt), 
+                                            nrow(pooled_fstage_dt)))))
+}
+```
+
+## Baseline predictions
+
+```{r}
+# Add predictions to children
+baseline_fs <- first_stage()
+
+children <- children %>%
+  merge.data.table(baseline_fs[[1]], by = "ID_DIFF", all.x = T, all.y = T)
+
+## Add baseline first-stage R2 to in-text figures
+in_text_figures <- in_text_figures %>%
+  rbind(baseline_fs[[2]] %>% .[, Label := paste("Baseline FS R2", Label)])
+
+# Compute child and family log income
+children <- children %>%
+  .[, family_log_income := log(ifelse(is.na(mother_log_income), 
+                                          0, exp(mother_log_income)) +
+                                     ifelse(is.na(father_log_income), 
+                                            0, exp(father_log_income)))] %>%
+  .[, family_income := exp(family_log_income)] %>%
+  .[, family_log_income_n := log((ifelse(is.na(mother_log_income), 
+                                       0, exp(mother_log_income)) +
+                                  ifelse(is.na(father_log_income), 
+                                         0, exp(father_log_income))) /
+                                 (as.numeric(!is.na(mother_log_income)) +
+                                    as.numeric(!is.na(father_log_income))))] %>%
+  .[ , ":=" (family_income_n = exp(family_log_income_n),
+             household_income = avg_revtotnonpsocm_real_2010_16_3545,
+             household_income_n = avg_revtotnonpsocm_real_n_2010_16_3545)] %>%
+  .[, ":=" (household_log_income_n = ifelse(household_income_n > 0, log(household_income_n), NA),
+            household_log_income = ifelse(household_income > 0, log(household_income), NA))]
+
+children <- children %>%
+  # Identify "incoherent" family structures
+  .[ , missing_parent := ifelse((is.na(father_log_income) & !type_fam %in% c("Both parents (mother active only)", "Mother only")) | 
+                                  (is.na(mother_log_income) & !type_fam %in% c("Both parents (father active only)", "Father only")), 1, 0)] %>%
+  # Rename main income variables
+  .[, ":=" (household_wage_n = avg_revsalm_real_n_2010_16_3545,
+            household_wage = avg_revsalm_real_2010_16_3545,
+            individual_income = avg_ytot_real_2010_16_3545,
+            labor_income = avg_ysali_real_2010_16_3545)] %>%
+  .[!is.na(father_log_income), father_income := exp(father_log_income)] %>%
+  .[, constant_sample := family_link == 3 & !is.na(avg_ysali_real_2010_16_3545) & !is.na(avg_revtotnonpsocm_real_2010_16_3545) & 
+                                      ((mother_cs2_90 > 20 & mother_cs2_90 != 31 | is.na(mother_cs2_90)) &
+                                         (father_cs2_90 > 20 & father_cs2_90 != 31 | is.na(father_cs2_90)))]
+```
+
+## Income ranks computation
+
+```{r}
+gen_ranks <- function(data, child_inc_var, parents_inc_var) {
+  
+  if (grepl("^family", parents_inc_var)) {
+    dat <- data %>%
+      .[, rank_parents_income := ifelse(missing_parent == 1, NA, get(parents_inc_var))] %>%
+      .[rank_parents_income < 0, rank_parents_income := 0] %>%
+      .[, rank_child_income := ifelse(get(child_inc_var) < 0, 0, get(child_inc_var))]
+  } else {
+    dat <- data[, rank_parents_income := get(parents_inc_var)] %>%
+      .[rank_parents_income < 0, rank_parents_income := 0] %>%
+      .[, rank_child_income := ifelse(get(child_inc_var) < 0, 0, get(child_inc_var))]
+  }
+  
+  # Name of the variables
+  child_rank_var <- paste(child_inc_var, parents_inc_var, "rank", sep = "_")
+  parents_rank_var <- paste(parents_inc_var, child_inc_var, "rank", sep = "_")
+  
+  return(dat %>%
+           .[, missing := (!constant_sample) | is.na(get(child_inc_var)) | is.na(rank_parents_income) | is.na(get(parents_inc_var))] %>%
+           # Rank child
+           .[order(missing, birth_year, get(child_inc_var), ID_DIFF), ] %>% 
+           # Compute percentile
+           .[, (child_rank_var) := ceiling(100 * (1:.N / .N)), by = c("missing", "birth_year")]  %>%
+           # Give the median rank to individuals with same income but different ranks
+           .[, (child_rank_var) := ceiling(median(get(child_rank_var))), 
+             by = c("missing", "birth_year", "rank_child_income")] %>%
+           # Replace rank by missing if income missing
+           .[, (child_rank_var) := ifelse(missing, NA, get(child_rank_var))] %>%
+           # Rank parents
+           .[order(missing, birth_year, get(parents_inc_var), ID_DIFF), ] %>%
+           # Compute percentile
+           .[, (parents_rank_var) := ceiling(100 * (1:.N / .N)), by = c("missing", "birth_year")] %>%
+           # Give the median rank to individuals with same income but different ranks
+           .[, (parents_rank_var) := ceiling(median(get(parents_rank_var))), 
+             by = c("missing", "birth_year", "rank_parents_income")] %>%
+           # Replace rank by missing if income missing
+           .[, (parents_rank_var) := ifelse(missing, NA, get(parents_rank_var))] %>%
+           # Remove temporary variables
+           .[, ":=" (rank_parents_income = NULL, missing = NULL)])
+}
+
+child_inc_vars <- c("household_income", "household_wage", "individual_income", "labor_income") 
+parents_inc_vars <- c("family_income_n", "father_income")
+
+for (i in child_inc_vars) { 
+  for (j in parents_inc_vars) { 
+    children <- gen_ranks(children, i, j)
+  }
+}
+
+for (i in c("household_income_n", "household_wage_n")) {
+  for (j in c("family_income_n", "father_income")) {
+    children <- gen_ranks(children, i, j)
+  }
+}
+
+children <- gen_ranks(children, "household_income", "family_income")
+```
+
+## Descriptive statistics
+
+```{r table_F5}
+nobs <- c()
+n0 <- c()
+n_neg <- c()
+for (i in child_inc_vars) {
+  # Family
+  temp <- children[constant_sample & missing_parent == 0 & !(is.na(family_income_n) | is.na(get(i)))]
+  nobs <- c(nobs, nrow(temp))
+  n0 <- c(n0, nrow(temp[get(i) == 0]))
+  n_neg <- c(n_neg, nrow(temp[get(i) < 0]))
+  
+  # Father
+  temp <- children[constant_sample & !(is.na(father_log_income) | is.na(get(i)))]
+  nobs <- c(nobs, nrow(temp))
+  n0 <- c(n0, nrow(temp[get(i) == 0]))
+  n_neg <- c(n_neg, nrow(temp[get(i) < 0]))
+}
+
+table_F5 <- tibble(child_inc = rep(child_inc_vars, each = 2),
+                   parents_inc = rep(c("Family income", "Father income"), 4),
+                   N_observations = nobs, N_0_income = n0, N_neg_income = n_neg) %>%
+  mutate(pct_0_income = round(100 * (N_0_income / N_observations), 2),
+         pct_neg_income = round(100 * (N_neg_income / N_observations), 2))
+
+table_F5
+fwrite(table_F5, paste0(prj_dir, "out/tab/tabF5_nobs_inc_definition.csv"))
+```
+
+```{r tabF6}
+# Synthetic parents
+desc_syn_parents <- distinct(syn_parents) %>%
+  .[nobs_RP90 > 0 & birth_year %% 2 == 0 & 
+     n_netinc_3545 >= 2 & !cs2_90 %in% c(11:13, 31), 
+   .(gender, avg_netinc_3545, n_netinc_3545)] %>%
+  pivot_longer(-gender, names_to = "var", values_to = "val") %>%
+  as.data.table() %>%
+  .[, .(N = .N,
+        Missing = 100 * mean(is.na(val)),
+        Mean = mean(val, na.rm = T),
+        SD = sd(val, na.rm = T),
+        Q1 = quantile(val, .25, na.rm = T),
+        Median = median(val, na.rm = T),
+        Q3 = quantile(val, .75, na.rm = T)), by = c("gender", "var")] %>%
+  .[, var := paste(var, gender)] %>% 
+  .[, gender := NULL]
+
+# Children
+desc_children <- children[family_link == 3 & constant_sample & 
+                            !mother_cs2_90 %in% c(11:13, 31) & 
+                            !father_cs2_90 %in% c(11:13, 31), 
+                          .SD, .SDcols = child_inc_vars] %>%
+  pivot_longer(everything(), names_to = "var", values_to = "val") %>%
+  as.data.table() %>% 
+  .[, .(N = .N,
+        Missing = 100 * mean(is.na(val)),
+        Mean = mean(val, na.rm = T),
+        SD = sd(val, na.rm = T),
+        Q1 = quantile(val, .25, na.rm = T),
+        Median = median(val, na.rm = T),
+        Q3 = quantile(val, .75, na.rm = T)), by = "var"]
+
+# Actual parents
+desc_act_parents <- children[family_link == 3 & !mother_cs2_90 %in% c(11:13, 31) & 
+           !father_cs2_90 %in% c(11:13, 31) & constant_sample,
+         .(mother_age_90, father_age_90,
+           father_age_birth = birth_year - (1990 - father_age_90),
+           mother_age_birth = birth_year - (1990 - mother_age_90))] %>%
+  pivot_longer(everything(), names_to = "var", values_to = "val") %>%
+  as.data.table() %>%
+  .[, .(N = .N,
+        Missing = 100 * mean(is.na(val)),
+        Mean = mean(val, na.rm = T),
+        SD = sd(val, na.rm = T),
+        Q1 = quantile(val, .25, na.rm = T),
+        Median = quantile(val, .5, na.rm = T),
+        Q3 = quantile(val, .75, na.rm = T)), by = "var"]
+
+table_F6 <- desc_syn_parents %>%
+  rbind(data.table(var = "Single parents",
+                   N = children[family_link == 3 & !mother_cs2_90 %in% c(11:13, 31) & 
+                                  !father_cs2_90 %in% c(11:13, 31) & constant_sample] %>% 
+                     .[, mean(type_fam %in% c("Mother only", "Father only"))],
+                   Missing = NA, Mean = NA, SD = NA, Q1 = NA, Median = NA, Q3 = NA)) %>%
+  rbind(data.table(var = "Females among single parents",
+                   N = children[family_link == 3 & !father_cs2_90 %in% c(11:13, 31) & 
+                                  !mother_cs2_90 %in% c(11:13, 31) & constant_sample & 
+                                  type_fam %in% c("Mother only", "Father only"), ] %>% 
+                     .[, mean(type_fam == "Mother only")],
+                   Missing = NA, Mean = NA, SD = NA, Q1 = NA, Median = NA, Q3 = NA)) %>%
+  rbind(desc_act_parents) %>%
+  rbind(desc_children) %>%
+  rbind(data.table(var = "Females",
+                   N = children[family_link == 3 & constant_sample & 
+                                  !mother_cs2_90 %in% c(11:13, 31) & !father_cs2_90 %in% c(11:13, 31)] %>%
+                     .[, mean(gender == "F")],
+                   Missing = NA, Mean = NA, SD = NA, Q1 = NA, Median = NA, Q3 = NA))
+
+table_F6
+fwrite(table_F6, paste0(prj_dir, "out/tab/tabF6_descriptive_statistics.csv"))
+```
+
+## Representativity
+
+```{r}
+vars <- c("ID_DIFF", "gender", "birth_year",
+          "mother_birth_year", "mother_french", "mother_cs",
+          "father_birth_year", "father_french", "father_cs",
+          "n_netinc_3545", "avg_netinc_2010_15_3545",
+          "n_revtotnonpsocm_real_3545", "avg_revtotnonpsocm_real_2010_16_3545")
+
+comparison_fullpop <- rbind(children[, group := "Full population"],
+      children[constant_sample & missing_parent == 0] %>%
+        .[, group := "Study sample"]) %>%
+  left_join(full_pop %>% select(ID_DIFF, contains(c("mother", "father")))) %>%
+  select(all_of(vars), group) %>%
+  rename(n_dads = n_netinc_3545,
+         n_fisc = n_revtotnonpsocm_real_3545,
+         avg_inc = avg_netinc_2010_15_3545,
+         fisc_income = avg_revtotnonpsocm_real_2010_16_3545) %>%
+  mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .)),
+         across(starts_with(c("mother_cs", "father_cs")), ~ ifelse(is.na(.), 0, .))) %>% 
+  setDT() %>%
+  .[, .(females = mean(gender == "F"),
+        mother_age_birth = mean(birth_year - mother_birth_year, na.rm = T),
+        mother_french = 100 * mean(mother_french, na.rm = T),
+        father_age_birth = mean(birth_year - father_birth_year, na.rm = T),
+        father_french = 100 * mean(father_french, na.rm = T),
+        single_mother = 100 * mean((is.na(father_birth_year) & father_cs == 0 & is.na(father_french)) &
+                                     !(is.na(mother_birth_year) & mother_cs == 0 & is.na(mother_french))),
+        missing_parent_info = 100 * mean(is.na(father_birth_year) & father_cs == 0 & is.na(father_french) &
+                                           is.na(mother_birth_year) & mother_cs == 0 & is.na(mother_french)),
+        father_missing = 100 * mean(father_cs == 0),
+        father_cs1 = 100 * mean(father_cs == 1),
+        father_cs2 = 100 * mean(father_cs == 2),
+        father_cs3 = 100 * mean(father_cs == 3),
+        father_cs4 = 100 * mean(father_cs == 4),
+        father_cs5 = 100 * mean(father_cs == 5),
+        father_cs6 = 100 * mean(father_cs == 6),
+        father_cs7 = 100 * mean(father_cs == 7),
+        father_cs8 = 100 * mean(father_cs == 8),
+        mother_missing = 100 * mean(mother_cs == 0),
+        mother_cs1 = 100 * mean(mother_cs == 1),
+        mother_cs2 = 100 * mean(mother_cs == 2),
+        mother_cs3 = 100 * mean(mother_cs == 3),
+        mother_cs4 = 100 * mean(mother_cs == 4),
+        mother_cs5 = 100 * mean(mother_cs == 5),
+        mother_cs6 = 100 * mean(mother_cs == 6),
+        mother_cs7 = 100 * mean(mother_cs == 7),
+        mother_cs8 = 100 * mean(mother_cs == 8),
+        # Income characteristics
+        in_dads = 100 * mean(n_dads >0),
+        in_fisc = 100 * mean(n_fisc >0),
+        n_dads = mean(n_dads),
+        n_fisc = mean(n_fisc),
+        p25_inc3545 = quantile(avg_inc, .25, na.rm = T),
+        p25_fisc_inc = quantile(fisc_income, .25, na.rm = T),
+        avg_inc3545 = mean(avg_inc, na.rm = T),
+        avg_fisc_inc = mean(fisc_income, na.rm = T),
+        med_inc3545 = median(avg_inc, na.rm = T),
+        med_fisc_inc = median(fisc_income, na.rm = T),
+        p75_inc3545 = quantile(avg_inc, .75, na.rm = T),
+        p75_fisc_inc = quantile(fisc_income, .75, na.rm = T),
+        .N),
+    by = "group"] %>% t() %>%
+  as.data.frame() %>%
+  rownames_to_column()
+
+fwrite(comparison_fullpop, paste0(prj_dir, "out/tab/comparison_fullpop.csv"))
+```
+
+# National results
+
+## Baseline results
+
+### Baseline coefficients
+
+```{r}
+children[, .(n_constant_sample = sum(constant_sample, na.rm = T),
+             n_estimation = sum(constant_sample & missing_parent == 0))]
+
+children[constant_sample & missing_parent == 1, 
+         mean(mother_cs2_90 %in% c(71, 74) | father_cs2_90 == 83)] 
+
+# Mothers with cs "anciens agriculteurs exploitants" and "anciens cadres" and fathers
+# with cs "militaires du contingent"
+
+
+# Baseline IGE
+ige <- summary(lm(household_log_income ~ family_log_income_n + factor(birth_year), 
+                  children[missing_parent == 0 & constant_sample]))$coefficients
+
+ige_n <- summary(lm(household_log_income_n ~ family_log_income_n + factor(birth_year), 
+                      children[missing_parent == 0 & constant_sample]))$coefficients
+
+# Baseline RRC
+rrc <- summary(lm(household_income_family_income_n_rank ~ family_income_n_household_income_rank + 
+                    factor(birth_year), children))$coefficients
+
+# Baseline AUM
+rrc[1, 1] + 25*rrc[2, 1]
+
+rrc_n <- summary(lm(household_income_n_family_income_n_rank ~ 
+                        family_income_n_household_income_n_rank + 
+                    factor(birth_year), children))$coefficients
+
+# IGE for middle 80%
+ige_mid <- summary(lm(household_log_income ~ family_log_income_n + factor(birth_year), 
+                      children[constant_sample & missing_parent == 0 & 
+                                 !is.na(family_log_income_n) & !is.na(household_log_income)] %>%
+                        .[family_log_income_n >= quantile(family_log_income_n, .1, na.rm = T) &
+                            family_log_income_n <= quantile(family_log_income_n, .9, na.rm = T)]))$coefficients
+
+ige_n_mid <- summary(lm(household_log_income_n ~ family_log_income_n + factor(birth_year), 
+                      children[constant_sample & missing_parent == 0 & 
+                                 !is.na(family_log_income_n) & !is.na(household_log_income_n)] %>%
+                        .[family_log_income_n >= quantile(family_log_income_n, .1, na.rm = T) &
+                            family_log_income_n <= quantile(family_log_income_n, .9, na.rm = T)]))$coefficients
+
+# RRC for middle 80%
+rrc_mid <- summary(lm(household_income_family_income_n_rank ~ family_income_n_household_income_rank + factor(birth_year), 
+                      children[family_income_n_household_income_rank >= 
+                                 quantile(family_income_n_household_income_rank, .1, na.rm = T) & 
+                                 family_income_n_household_income_rank <= 
+                                 quantile(family_income_n_household_income_rank, .9, na.rm = T)]))$coefficients
+
+rrc_n_mid <- summary(lm(household_income_n_family_income_n_rank ~ family_income_n_household_income_n_rank + factor(birth_year), 
+                      children[family_income_n_household_income_n_rank >= 
+                                 quantile(family_income_n_household_income_n_rank, .1, na.rm = T) & 
+                                 family_income_n_household_income_n_rank <= 
+                                 quantile(family_income_n_household_income_n_rank, .9, na.rm = T)]))$coefficients
+```
+
+### Baseline CEFs
+
+```{r fig1}
+fig1A <- children %>%
+  filter(constant_sample & missing_parent == 0 & !is.na(family_income_n_household_income_rank) & 
+           !is.na(household_log_income)) %>%
+  group_by(family_income_n_household_income_rank) %>%
+  summarise(n = n(),
+            household_log_income = mean(household_log_income),
+            family_log_income_n = mean(family_log_income_n)) %>%
+  mutate(coef = ige[2, 1], se = ige[2, 2],
+         coef_mid = ige_mid[2, 1], se_mid = ige_mid[2, 2]) %>%
+  select(n, family_log_income_n, household_log_income, coef, se, coef_mid, se_mid) %>%
+  arrange(n)
+
+fwrite(fig1A, paste0(prj_dir, "out/fig/fig1A_cef_log_income.csv"))
+
+ggplot(fig1A, aes(x = family_log_income_n, y = household_log_income)) + 
+  geom_point(alpha = .5) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = F) +
+  geom_vline(xintercept = c(fig1A$family_log_income_n[10], 
+                            fig1A$family_log_income_n[91]), 
+             linetype = "dashed") + 
+  annotate("text", x = 9.5, y = 10.5, 
+           label = paste0("IGE: ", round(unique(fig1A$coef), 2), 
+                          " (", round(unique(fig1A$se), 3), ")\n",
+                          "IGE[Par. Inc. P10-P90]: ", round(unique(fig1A$coef_mid), 2), 
+                          " (", round(unique(fig1A$se_mid), 3), ")\n")) 
+
+ggsave(paste0(prj_dir, "out/fig/fig1A_cef_log_income.png"))
+
+fig1B <- children  %>%
+  filter(!is.na(family_income_n_household_income_rank)) %>%
+  group_by(family_income_n_household_income_rank) %>%
+  summarise(n = n(), child_rank = mean(household_income_family_income_n_rank)) %>%
+  mutate(coef = rrc[2, 1], se = rrc[2, 2],
+         coef_mid = rrc_mid[2, 1], se_mid = rrc_mid[2, 2]) %>%
+  rename(family_rank = family_income_n_household_income_rank) %>%
+  select(n, family_rank, child_rank, coef, se, coef_mid, se_mid) %>%
+  arrange(n)
+
+fwrite(fig1B, paste0(prj_dir, "out/fig/fig1B_cef_rank.csv"))
+
+ggplot(fig1B, aes(x = family_rank, y = child_rank)) + 
+  geom_point(alpha = .5) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = F) +
+  geom_vline(xintercept = c(10, 90), linetype = "dashed") + 
+  annotate("text", x = 50, y = 70, 
+           label = paste0("IGE: ", round(unique(fig1B$coef), 2), 
+                          " (", round(unique(fig1B$se), 3), ")\n",
+                          "IGE[Par. Inc. P10-P90]: ", round(unique(fig1B$coef_mid), 2), 
+                          " (", round(unique(fig1B$se_mid), 3), ")\n")) 
+
+ggsave(paste0(prj_dir, "out/fig/fig1B_cef_rank.png"))
+
+log_cef_n <- children %>%
+  filter(constant_sample & missing_parent == 0 & !is.na(family_income_n_household_income_n_rank)) %>%
+  group_by(family_income_n_household_income_n_rank) %>%
+  summarise(n = n(),
+            household_log_income = mean(household_log_income_n, na.rm = T),
+            family_log_income_n = mean(family_log_income_n, na.rm = T)) %>%
+  mutate(coef = ige_n[2, 1], se = ige_n[2, 2],
+         coef_mid = ige_n_mid[2, 1], se_mid = ige_n_mid[2, 2]) %>%
+  select(n, family_log_income_n, household_log_income, coef, se, coef_mid, se_mid) %>%
+  arrange(n)
+
+fwrite(log_cef_n, paste0(prj_dir, "out/fig/log_cef_n.csv"))
+
+ggplot(log_cef_n, aes(x = family_log_income_n, y = household_log_income)) + 
+  geom_point(alpha = .5) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = F) +
+  geom_vline(xintercept = c(log_cef_n$family_log_income_n[10], 
+                            log_cef_n$family_log_income_n[91]), 
+             linetype = "dashed") + 
+  annotate("text", x = 9.5, y = 10.5, 
+           label = paste0("IGE: ", round(unique(log_cef_n$coef), 2), 
+                          " (", round(unique(log_cef_n$se), 3), ")\n",
+                          "IGE[Par. Inc. P10-P90]: ", round(unique(log_cef_n$coef_mid), 2), 
+                          " (", round(unique(log_cef_n$se_mid), 3), ")\n")) 
+
+ggsave(paste0(prj_dir, "out/fig/log_cef_n.png"))
+
+rrc_cef_n <- children  %>%
+  filter(!is.na(family_income_n_household_income_n_rank)) %>%
+  group_by(family_income_n_household_income_n_rank) %>%
+  summarise(n = n(), child_rank = mean(household_income_n_family_income_n_rank)) %>%
+  mutate(coef = rrc_n[2, 1], se = rrc_n[2, 2],
+         coef_mid = rrc_n_mid[2, 1], se_mid = rrc_n_mid[2, 2]) %>%
+  rename(family_rank = family_income_n_household_income_n_rank) %>%
+  select(n, family_rank, child_rank, coef, se, coef_mid, se_mid) %>%
+  arrange(n)
+
+fwrite(rrc_cef_n, paste0(prj_dir, "out/fig/rrc_cef_n.csv"))
+
+ggplot(rrc_cef_n, aes(x = family_rank, y = child_rank)) + 
+  geom_point(alpha = .5) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = F) +
+  geom_vline(xintercept = c(10, 90), linetype = "dashed") + 
+  annotate("text", x = 50, y = 70, 
+           label = paste0("IGE: ", round(unique(rrc_cef_n$coef), 2), 
+                          " (", round(unique(rrc_cef_n$se), 3), ")\n",
+                          "IGE[Par. Inc. P10-P90]: ", round(unique(rrc_cef_n$coef_mid), 2), 
+                          " (", round(unique(rrc_cef_n$se_mid), 3), ")\n")) 
+
+ggsave(paste0(prj_dir, "out/fig/rrc_cef_n.png"))
+
+in_text_figures %>%
+  rbind(data.table(Label = "Excluded <= 0 Fig1 panel A",
+                   Figure =  1 - (sum(fig1A$n)/ sum(children$constant_sample, na.rm = T)),
+                   N = sum(children$constant_sample, na.rm = T)))
+```
+
+### Baseline Transition Matrix
+
+```{r fig2}
+fig2 <- children %>% 
+  filter(!is.na(family_income_n_household_income_rank)) %>% 
+  mutate(family_quintile = as.numeric(cut(family_income_n_household_income_rank, 
+                                          breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+  mutate(child_quintile = as.numeric(cut(household_income_family_income_n_rank, 
+                                         breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+  select(child_quintile, family_quintile) %>%
+  group_by(family_quintile) %>%
+  mutate(n_bar = n()) %>%
+  group_by(family_quintile, child_quintile) %>%
+  summarise(n = n(), share = n() / unique(n_bar),
+            pct = paste0(round(100 * share, 1), "%")) %>%
+  select(n, family_quintile, child_quintile, share, pct) %>%
+  arrange(n)
+
+fwrite(fig2, paste0(prj_dir, "out/fig/fig2_tm.csv"))
+
+ggplot(fig2, aes(x = family_quintile, y = share, fill = factor(-child_quintile), label = pct)) +
+  geom_bar(position = "fill", stat = "identity", width = .99) +
+  geom_text(position = position_stack(vjust = .5), color = "Black")
+
+ggsave(paste0(prj_dir, "out/fig/fig2_tm.png"))
+
+tm_n <- children %>% 
+  filter(!is.na(family_income_n_household_income_n_rank)) %>% 
+  mutate(family_quintile = as.numeric(cut(family_income_n_household_income_n_rank, 
+                                          breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+  mutate(child_quintile = as.numeric(cut(household_income_n_family_income_n_rank, 
+                                         breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+  select(child_quintile, family_quintile) %>%
+  group_by(family_quintile) %>%
+  mutate(n_bar = n()) %>%
+  group_by(family_quintile, child_quintile) %>%
+  summarise(n = n(), share = n() / unique(n_bar),
+            pct = paste0(round(100 * share, 1), "%")) %>%
+  select(n, family_quintile, child_quintile, share, pct) %>%
+  arrange(n)
+
+fwrite(tm_n, paste0(prj_dir, "out/fig/tm_n.csv"))
+
+ggplot(tm_n, aes(x = family_quintile, y = share, fill = factor(-child_quintile), label = pct)) +
+  geom_bar(position = "fill", stat = "identity", width = .99) +
+  geom_text(position = position_stack(vjust = .5), color = "Black")
+
+ggsave(paste0(prj_dir, "out/fig/tm_n.png"))
+```
+
+```{r figC1}
+# Top-income transition matrices
+figC1 <- lapply(c(10, 5, 2), function(x) {
+  
+  children %>% 
+    filter(!is.na(family_income_n_household_income_rank)) %>% 
+    mutate(family_quantile = as.numeric(cut(family_income_n_household_income_rank, 
+                                            breaks = seq(0, 100, x), na.rm = TRUE))) %>%
+    mutate(child_quantile = as.numeric(cut(household_income_family_income_n_rank, 
+                                           breaks = seq(0, 100, x), na.rm = TRUE))) %>%
+    filter(family_quantile == 100 / x) %>%
+    select(child_quantile, family_quantile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quantile, child_quantile) %>%
+    summarise(n = n(), share = n() / unique(n_bar),
+              pct = paste0(round(100 * share, 2), "%"),
+              quantile = 100 / x)
+  
+}) %>% rbindlist() %>%
+  arrange(quantile, -share) %>%
+  mutate(temp = ifelse(share < .04, 1, 0)) %>%
+  group_by(quantile, temp) %>%
+  mutate(pct = ifelse(share == share[1] & temp == 1, "<4%", pct),
+         pct = ifelse(share != share[1] & temp == 1, "", pct)) %>%
+  ungroup() %>%
+  select(n, quantile, family_quantile, child_quantile, share, pct) %>%
+  arrange(n) %>%
+  filter(n > 10)
+
+fwrite(figC1, paste0(prj_dir, "out/fig/figC1_top_tm.csv"))
+
+ggplot(figC1, aes(x = family_quantile, y = share, label = pct, fill = share)) +
+  geom_bar(position = "fill", stat = "identity", width = .99) +
+  geom_text(position = position_stack(vjust = .5), color = "white") +
+  facet_wrap(~quantile, scales = "free")
+
+ggsave(paste0(prj_dir, "out/fig/figC1_top_tm.png"))
+```
+
+### Mean vs sum of parents income
+
+```{r}
+# Response to referees
+children %>% 
+  .[missing_parent == 0, .(ID_DIFF, family_log_income_n, family_log_income,
+                  Parents = ifelse(is.na(mother_log_income) | is.na(father_log_income),
+                                   "Single", "Couple"))] %>% 
+  melt(id.vars = c("ID_DIFF", "Parents"), variable.name = "Type", value.name = "Income") %>%
+  .[, Type := ifelse(grepl("_n", Type), "Mean", "Sum")] %>%
+  ggplot(aes(x = Income, fill = Parents)) + 
+  geom_density(alpha = .7, color = NA) + 
+  facet_wrap(~Type, ncol = 1)
+
+ggsave(paste0(prj_dir, "out/fig/distributions_mean_sum.png"))
+
+mean_vs_sum <- rbind(children %>%
+                       filter(missing_parent == 0 & !is.na(family_income_household_income_rank)) %>%
+                       group_by(family_income_household_income_rank) %>%
+                       summarise(n = n(), single = mean(is.na(mother_log_income) | is.na(father_log_income))) %>% 
+                       rename(family_rank = family_income_household_income_rank) %>%
+                       mutate(inc_type = "sum"),
+                     children %>%
+                       filter(missing_parent == 0 & !is.na(family_income_n_household_income_n_rank)) %>%
+                       group_by(family_income_n_household_income_n_rank) %>%
+                       summarise(n = n(), single = mean(is.na(mother_log_income) | is.na(father_log_income))) %>% 
+                       rename(family_rank = family_income_n_household_income_n_rank) %>%
+                       mutate(inc_type = "mean")) %>%
+  select(n, family_rank, single, inc_type) %>%
+  arrange(n)
+
+fwrite(mean_vs_sum, paste0(prj_dir, "out/fig/mean_vs_sum.csv"))
+
+ggplot(mean_vs_sum, aes(x = family_rank, y = single, color = inc_type)) +
+  geom_point() + geom_line()
+
+ggsave(paste0(prj_dir, "out/fig/mean_vs_sum.png"))
+```
+
+## By set of instruments
+
+```{r}
+instruments <- data.table(
+  
+  instru_lab = c("Education", "+ 2digit occ.", "+ demographic char.", "+ mun. char."),
+  
+  num = list(c("gender"), c("gender"), c("gender", "age_90", "born_french"),
+             c("gender", "age_90", "born_french", "unemp_mun", "foreign_mun", 
+               "single_mun", "density_mun", "pop_mun")),
+  
+  fac = list(c("edu_90"), c("edu_90", "cs2_90"), c("edu_90", "cs2_90", "cbirth", "type_fam"),
+             c("edu_90", "cs2_90", "cbirth", "type_fam"))
+)
+
+baseline_results <- lapply(1:nrow(instruments), function (x) {
+  
+  # First stage
+  fs <- first_stage(numeric_instru = unlist(instruments$num[x]),
+                    factor_instru = unlist(instruments$fac[x]))
+  
+  # Add predictions
+  data_temp <- copy(children) %>%
+    .[, ":=" (mother_log_income = NULL, father_log_income = NULL)] %>%
+    merge.data.table(fs[[1]], by = "ID_DIFF", all.x = T, all.y = T) %>%
+    .[, family_log_income_n := log((ifelse(is.na(mother_log_income), 
+                                       0, exp(mother_log_income)) +
+                                  ifelse(is.na(father_log_income), 
+                                         0, exp(father_log_income))) /
+                                 (as.numeric(!is.na(mother_log_income)) +
+                                    as.numeric(!is.na(father_log_income))))] %>%
+    .[ , family_income_n := exp(family_log_income_n)] %>%
+    # Identify "incoherent" family structures
+    .[ , missing_parent := ifelse((
+      is.na(father_log_income) & !type_fam %in% c(
+        "Both parents (mother active only)", "Mother only")) | 
+        (is.na(mother_log_income) & !type_fam %in% c(
+          "Both parents (father active only)", "Father only")), 1, 0)]  %>%
+    # Trim 
+    gen_ranks("household_income", "family_income_n")
+  
+  # Regressions
+  ige <- summary(lm(household_log_income ~ family_log_income_n + factor(birth_year), data_temp[constant_sample & missing_parent == 0]))
+  rrc <- summary(lm(household_income_family_income_n_rank ~ family_income_n_household_income_rank + factor(birth_year), data_temp))
+  
+  regs <- data.table(instru = instruments$instru_lab[x],
+                     estimator = c("IGE", "RRC"),
+                     father_R2 = fs[[2]][2, 2],
+                     mother_R2 = fs[[2]][1, 2],
+                     coef = c(ige$coefficients[2, 1], rrc$coefficients[2, 1]),
+                     se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2]),
+                     df = c(ige$df[2], rrc$df[2]),
+                     N_reg = c(length(ige$residuals), length(rrc$residuals)))
+  
+  # Cefs
+  cef_log_income <- data_temp %>%
+    filter(constant_sample & missing_parent == 0 & !is.na(family_income_n_household_income_rank)) %>%
+    group_by(family_income_n_household_income_rank) %>%
+    summarise(n = n(),
+              household_log_income = mean(household_log_income, na.rm = T),
+              family_log_income_n = mean(family_log_income_n, na.rm = T))
+  
+  cef_rank <- data_temp %>%
+    filter(!is.na(family_income_n_household_income_rank)) %>%
+    group_by(family_income_n_household_income_rank) %>%
+    summarise(child_rank = mean(household_income_family_income_n_rank))
+  
+  cefs <- full_join(cef_log_income, cef_rank) %>%
+    mutate(instru = instruments$instru_lab[x])
+  
+  # Transition matrix
+  tm <- data_temp %>% 
+           filter(!is.na(family_income_n_household_income_rank)) %>% 
+           mutate(family_quintile = as.numeric(cut(family_income_n_household_income_rank, 
+                                                   breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+           mutate(child_quintile = as.numeric(cut(household_income_family_income_n_rank, 
+                                                  breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+           select(child_quintile, family_quintile) %>%
+           group_by(family_quintile) %>%
+           mutate(n_bar = n()) %>%
+           group_by(family_quintile, child_quintile) %>%
+           summarise(n = n(),
+                     instru = instruments$instru_lab[x],
+                     share = n() / unique(n_bar),
+                     pct = paste0(round(100 * share, 1), "%"))
+  
+  return(list(regs, cefs, tm))
+})
+
+regs_instru <- lapply(1:4, function(x) {baseline_results[[x]][[1]]}) %>% rbindlist()
+cefs_instru <- lapply(1:4, function(x) {baseline_results[[x]][[2]]}) %>% rbindlist()
+tm_instru <- lapply(1:4, function(x) {baseline_results[[x]][[3]]}) %>% rbindlist()
+```
+
+### Robustness to instruments
+
+```{r figB3}
+# Log CEFs
+figB3A <- cefs_instru[, .(n, household_log_income, family_log_income_n, instru)] %>%
+  merge.data.table(regs_instru[estimator == "IGE", .(instru, coef, se)]) %>%
+  arrange(n)
+
+fwrite(figB3A, paste0(prj_dir, "out/fig/figB3A_log_cefs_instru.csv"))
+
+ggplot(figB3A %>% mutate(instru = paste0(instru, "\n IGE=", round(coef, 2), " (", round(se, 3), ")")), 
+       aes(x = family_log_income_n, y = household_log_income)) + geom_point(alpha = .5) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = F) + facet_wrap(~instru, nrow = 1)
+ggsave(paste0(prj_dir, "out/fig/figB3A_log_cefs_instru.png"))
+
+# Rank CEFs
+figB3B <- cefs_instru[, .(n, child_rank, family_rank = family_income_n_household_income_rank, instru)] %>%
+  merge.data.table(regs_instru[estimator == "RRC", .(instru, coef, se)]) %>%
+  arrange(n)
+fwrite(figB3B, paste0(prj_dir, "out/fig/figB3B_rank_cefs_instru.csv"))
+
+ggplot(figB3B %>% mutate(instru = paste0(instru, "\n RRC=", round(coef, 2), " (", round(se, 3), ")")), 
+       aes(x = family_rank, y = child_rank)) + geom_point(alpha = .5) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = F) + facet_wrap(~instru, nrow = 1)
+ggsave(paste0(prj_dir, "out/fig/figB3B_rank_cefs_instru.png"))
+
+# Transition matrix
+figB3C <- tm_instru %>% select(n, instru, family_quintile, child_quintile, share, pct) %>% arrange(n)
+fwrite(figB3C, paste0(prj_dir, "out/fig/figB3C_tms.csv"))
+
+ggplot(figB3C, aes(x = family_quintile, y = share, fill = child_quintile, label = pct)) +
+  geom_bar(position = "fill", stat = "identity", width = .99) +
+  geom_text(position = position_stack(vjust = .5), color = "white") +
+  facet_wrap(~instru, nrow = 1)
+ggsave(paste0(prj_dir, "out/fig/figB3C_tms.png"))
+
+# First stage R2
+figB3D <- regs_instru[, .(n = N_reg, instru, father_R2.Figure, mother_R2.Figure)] %>% distinct() %>%
+  pivot_longer(c(father_R2.Figure, mother_R2.Figure), names_to = "parent", values_to = "R2") %>%
+  arrange(n)
+fwrite(figB3D, paste0(prj_dir, "out/fig/figB3D_FS_R2.csv"))
+
+ggplot(figB3D, aes(x = parent, fill = parent, y = R2)) +
+  geom_bar(stat = "identity") + facet_wrap(~instru, nrow = 1)
+ggsave(paste0(prj_dir, "out/fig/figB3D_FS_R2.png"))
+```
+
+### Robustness to machine learning
+
+```{r figB2}
+# Run second stages
+
+# Continuous instruments
+contcov = c("gender", "age_90", "born_french", "unemp_mun", 
+            "foreign_mun", "single_mun", "density_mun", "pop_mun")
+# Categorical instruments
+discov = c("cbirth", "edu_90", "cs2_90", "type_fam")
+
+# Remove spaces and parentheses in variable names
+chl_fathers <- children[family_link == 3, ] %>%
+  .[father_cs2_90 %in% c(11:13, 31), father_cs2_90 := NA] %>%
+  .[, gender := 0] %>% 
+  .[, .SD, .SDcols = c("ID_DIFF", names(children)[names(children) %in% c(discov, contcov, 
+                                                                         paste0("father_", c(discov, contcov)))])] 
+
+chl_mothers <- children[family_link == 3, ] %>%
+  .[mother_cs2_90 %in% c(11:13, 31), mother_cs2_90 := NA] %>%
+  .[, gender := 1] %>% 
+  .[, .SD, .SDcols = c("ID_DIFF", names(children)[names(children) %in% c(discov, contcov, 
+                                                                         paste0("mother_", c(discov, contcov)))])] 
+
+names(chl_fathers) <- sub("^father_", "", names(chl_fathers))
+names(chl_mothers) <- sub("^mother_", "", names(chl_mothers))
+
+for (i in discov) {
+  chl_fathers <- chl_fathers[get(i) %in% unique(syn_parents_FS[gender == 0, get(i)]), ]
+  chl_mothers <- chl_mothers[get(i) %in% unique(syn_parents_FS[gender == 1, get(i)]), ]
+}
+
+chl_encoded <- rbind(chl_mothers, chl_fathers)
+
+for (i in discov) {
+  for (j in sort(unique(chl_encoded[[i]]))[-1]) {
+    chl_encoded[, (paste(i, j, sep = "_")) := lapply(.SD, function(x) {as.numeric(x == j)}), .SDcols = i]
+  }
+}
+
+# Remove discrete variables
+chl_encoded[, (discov) := NULL]
+names(chl_encoded) <- gsub(" |\\(|\\)", "_", names(chl_encoded))
+
+# Merge with mother and father predicted income
+predictions <- chl_encoded %>% .[gender == 1, .(ID_DIFF)] %>% 
+  # Mother predicted income
+  .[, ":=" (
+    mother_log_income_ols = predict(
+      ml_results[[1]][[2]], newdata = chl_encoded %>% filter(gender == 1) %>% 
+        select(ml_results[[1]][[2]]$varNames), onlySL = TRUE)$pred,
+    mother_log_income_gam = predict(
+      ml_results[[2]][[2]], newdata = chl_encoded %>% filter(gender == 1) %>% 
+        select(ml_results[[2]][[2]]$varNames), onlySL = TRUE)$pred,
+    mother_log_income_xgb = predict(
+      ml_results[[3]][[2]], newdata = chl_encoded %>%filter(gender == 1) %>% 
+        select(ml_results[[3]][[2]]$varNames), onlySL = TRUE)$pred,
+    mother_log_income_ens = predict(
+      ml_results[[4]][[2]], newdata = chl_encoded %>%filter(gender == 1) %>% 
+        select(ml_results[[4]][[2]]$varNames), onlySL = TRUE)$pred)] %>%
+  # Father predicted income
+  merge.data.table(chl_encoded %>% .[gender == 0, .(ID_DIFF)] %>% .[, ":=" (
+    father_log_income_ols = predict(
+      ml_results[[1]][[1]], newdata = chl_encoded %>% filter(gender == 0) %>% 
+        select(ml_results[[1]][[1]]$varNames), onlySL = TRUE)$pred,
+    father_log_income_gam = predict(
+      ml_results[[2]][[1]], newdata = chl_encoded %>% filter(gender == 0) %>% 
+        select(ml_results[[2]][[1]]$varNames), onlySL = TRUE)$pred,
+    father_log_income_xgb = predict(
+      ml_results[[3]][[1]], newdata = chl_encoded %>% filter(gender == 0) %>% 
+        select(ml_results[[3]][[1]]$varNames), onlySL = TRUE)$pred,
+    father_log_income_ens = predict(
+      ml_results[[4]][[1]], newdata = chl_encoded %>%filter(gender == 0) %>% 
+        select(ml_results[[4]][[1]]$varNames), onlySL = TRUE)$pred)],
+    by = "ID_DIFF", all.x = T, all.y = T)
+
+# Add predictions to children
+children <- children %>%
+  merge.data.table(predictions, by = "ID_DIFF", all.x = T, all.y = T)
+
+# Compute IGE/RRC/Probas for each ml method
+figB2A <- lapply(c("ols", "gam", "xgb", "ens"), function (i) {
+  
+  # Compute child and family log income
+  children <- children %>%
+    .[, (paste0("family_log_income_n_", i)) := log(
+      (ifelse(is.na(get(paste0("mother_log_income_", i))), 
+              0, exp(get(paste0("mother_log_income_", i)))) +
+         ifelse(is.na(get(paste0("father_log_income_", i))), 
+                0, exp(get(paste0("father_log_income_", i))))) /
+        (as.numeric(!is.na(get(paste0("mother_log_income_", i)))) +
+           as.numeric(!is.na(get(paste0("father_log_income_", i))))))] %>%
+    .[, (paste0("family_income_n_", i)) := exp(get(paste0("family_log_income_n_", i)))]   %>%
+    # Gen ranks
+    gen_ranks("household_income", paste0("family_income_n_", i))
+  
+  # Regressions
+  ige <- summary(lm(paste0("household_log_income ~ family_log_income_n_", i, 
+                           "+ factor(birth_year)"), children[constant_sample & missing_parent == 0]))
+  rrc <- summary(lm(paste0("household_income_family_income_n_", i, "_rank ~ family_income_n_", 
+                           i, "_household_income_rank + factor(birth_year)"), children))
+  
+  # Transition matrix
+  tm <- children %>% 
+           filter(!is.na(get(paste0('family_income_n_', i, '_household_income_rank')))) %>% 
+           mutate(family_quintile = as.numeric(cut(get(paste0('family_income_n_', i, '_household_income_rank')), 
+                                                   breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+           mutate(child_quintile = as.numeric(cut(get(paste0("household_income_family_income_n_", i, "_rank")), 
+                                                  breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+           select(child_quintile, family_quintile) %>%
+           group_by(family_quintile) %>%
+           mutate(n_bar = n()) %>%
+           group_by(family_quintile, child_quintile) %>%
+           summarise(n = n(), share = n() / unique(n_bar))
+  
+  return(data.table(method = i,
+                    estimator = c("IGE", "RRC", "bot_bot", "bot_top"),
+                    coef = c(ige$coefficients[2, 1], rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], NA, NA),
+                    df = c(ige$df[2], rrc$df[2], NA, NA),
+                    n = c(length(ige$residuals), length(rrc$residuals),
+                          pull(filter(tm, family_quintile == 1 & child_quintile == 1), n),
+                          pull(filter(tm, family_quintile == 1 & child_quintile == 5), n))))
+}) %>% rbindlist() %>%
+  mutate(order_method = case_when(method == "ols" ~ 1,
+                                  method == "gam" ~ 2,
+                                  method == "xgb" ~ 3,
+                                  method == "ens" ~ 4),
+         method = case_when(method == "ols" ~ "Baseline",
+                            method == "gam" ~ "GAM",
+                            method == "xgb" ~ "Boosted tree",
+                            method == "ens" ~ "Ensemble method"),
+         order_estim = case_when(estimator == "IGE" ~ 1,
+                                 estimator == "RRC" ~ 2,
+                                 estimator == "bot_bot" ~ 3,
+                                 estimator == "bot_top" ~ 4)) %>%
+  select(n, method, order_method, coef, estimator, order_estim) %>%
+  arrange(n)
+
+fwrite(figB2A, paste0(prj_dir, "out/fig/figB2A_machine_learning.csv"))
+
+ggplot(figB2A, aes(x = reorder(method, order_method), y = coef, 
+                   fill = reorder(estimator, order_estim))) + 
+  geom_bar(stat = "identity", position = "dodge")
+ggsave(paste0(prj_dir, "out/fig/figB2A_machine_learning.png"))
+
+figB2B <- tibble(n = rep(c(nrow(syn_encoded[gender == 0, ]), 
+                           nrow(syn_encoded[gender == 1, ])), each = 4),
+                 method = rep(c("Baseline", "GAM", "Boosted tree", "Ensemble method"),  2),
+                 order_method = rep(1:4,  2),
+                 group = rep(c("Males", "Female"), each = 4),
+                 mse = c(summary(cv_results[[1]])$Table[c(3, 4, 5, 1), 2], 
+                         summary(cv_results[[2]])$Table[c(3, 4, 5, 1), 2])) %>%
+  arrange(n)
+
+fwrite(figB2B, paste0(prj_dir, "out/fig/figB2B_machine_learning_mse.csv"))
+
+ggplot(figB2B, aes(x = order_method, y = mse, color = group)) +
+  geom_line() + geom_point()
+ggsave(paste0(prj_dir, "out/fig/figB2B_machine_learning_mse.png"))
+```
+
+## By income definition
+
+```{r}
+restrictions <- data.table(child_var = rep(child_inc_vars, 6),
+                           parents_var = rep(rep(parents_inc_vars, each = 4), 3),
+                           subsample = rep(c(list(c("F", "M")), "F", "M"), each = 8))
+
+restrictions <- rbind(restrictions %>% mutate(replace0 = 0),
+                      restrictions %>% mutate(replace0 = 1),
+                      restrictions %>% mutate(replace0 = 1000)) %>%
+  # Consider only the specifications that will be reported
+  .[!(replace0 > 0 & (parents_var == "father_income" | child_var == "household_wage")), ]
+
+inc_def <- lapply(1:nrow(restrictions), function (x) {
+  
+  if (restrictions$parents_var[x] == "family_income"){
+    dat <- copy(children) %>% .[missing_parent == 0 & constant_sample]
+  } else {
+    dat <- copy(children) %>% .[constant_sample == T]
+  }
+  
+  dat <- dat %>% 
+    .[get(restrictions$child_var[x]) <= 0, 
+      (restrictions$child_var[x]) := restrictions$replace0[x]] %>% 
+    gen_ranks(restrictions$child_var[x], restrictions$parents_var[x]) %>%
+    .[get(restrictions$child_var[x]) > 0, y := log(get(restrictions$child_var[x]))] %>%
+    .[gender %in% unlist(restrictions$subsample[x])]
+  
+  ige <- summary(lm(paste0("y ~ log(", restrictions$parents_var[x], ") + factor(birth_year)"), dat))
+  
+  rrc <- summary(lm(paste(paste(restrictions$child_var[x], restrictions$parents_var[x], "rank", sep = "_"), "~", 
+             paste(restrictions$parents_var[x], restrictions$child_var[x], "rank", sep = "_"), "+ factor(birth_year)"), dat))
+  
+  return(data.table(child_var = restrictions$child_var[x],
+                    parents_var = restrictions$parents_var[x],
+                    estimator = c("IGE", "RRC"),
+                    subsample = restrictions$subsample[x],
+                    replace0 = restrictions$replace0[x],
+                    coef = c(ige$coefficients[2, 1], rrc$coefficients[2, 1]),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2]),
+                    df = c(ige$df[2], rrc$df[2]),
+                    N = c(length(ige$residuals), length(rrc$residuals))))
+  
+}) %>% rbindlist()
+```
+
+### Intergenerational elasticity
+
+```{r figE3}
+# Figure E3
+figE3 <- inc_def %>% 
+  filter(replace0 == 0 & estimator == "IGE") %>%
+  mutate(i = row_number()) %>%
+  group_by(i) %>%
+  mutate(subsample = paste0(unlist(subsample), collapse = "")) %>%
+  ungroup() %>% select(-i) %>%
+  mutate(lab = round(coef, 2),
+         lb = coef - qt(.975, df) * se,
+         ub = coef + qt(.975, df) * se) %>%
+  select(n = N, subsample, coef, lb, ub, child_var, parents_var, lab) %>%
+  arrange(n)
+fwrite(figE3, paste0(prj_dir, "out/fig/figE3_IGE_child_inc_var.csv"))
+
+ggplot(figE3, aes(x = subsample, y = coef, fill = child_var, label = lab)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), position = position_dodge()) +
+  geom_text() + facet_wrap(~parents_var, scales = "free_x")
+ggsave(paste0(prj_dir, "out/fig/figE3_IGE_child_inc_var.png"))
+```
+
+### Rank-rank correlation
+
+```{r figE4}
+# Figure E4
+figE4 <- inc_def %>% 
+  filter(replace0 == 0 & estimator == "RRC") %>%
+  mutate(i = row_number()) %>%
+  group_by(i) %>%
+  mutate(subsample = paste0(unlist(subsample), collapse = "")) %>%
+  ungroup() %>% select(-i) %>%
+  mutate(lab = round(coef, 2),
+         lb = coef - qt(.975, df) * se,
+         ub = coef + qt(.975, df) * se) %>%
+  select(n = N, subsample, coef, lb, ub, child_var, parents_var, lab) %>%
+  arrange(n)
+fwrite(figE4, paste0(prj_dir, "out/fig/figE4_RRC_child_inc_var.csv"))
+
+ggplot(figE4, aes(x = subsample, y = coef, fill = child_var, label = lab)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), position = position_dodge()) +
+  geom_text() + facet_wrap(~parents_var, scales = "free_x")
+ggsave(paste0(prj_dir, "out/fig/figE4_RRC_child_inc_var.png"))
+```
+
+### Transition matrix
+
+```{r figE5}
+figE5 <- lapply(child_inc_vars[-1], function(x) {
+  
+  children %>% 
+    filter(!is.na(get(paste0("family_income_n_", x, "_rank")))) %>% 
+    mutate(family_quintile = as.numeric(cut(get(paste0("family_income_n_", x, "_rank")), 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(get(paste0(x, "_family_income_n_rank")), 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(n = n(), share = n() / unique(n_bar),
+              pct = paste0(round(100 * share, 1), "%"),
+              variable = x) 
+  
+}) %>% rbindlist() %>% 
+  rbind(as.data.table(fig2)[, variable := "household_income"]) %>%
+  select(n, variable, family_quintile, child_quintile, share, pct) %>%
+  arrange(n)
+
+fwrite(figE5, paste0(prj_dir, "out/fig/figE5_TM_child_inc_var.csv"))
+
+ggplot(figE5, aes(x = family_quintile, y = share,  fill = factor(-child_quintile), label = pct)) +
+  geom_bar(position = "fill", stat = "identity", width = .99) +
+  geom_text(position = position_stack(vjust = .5), color = "white") +
+  facet_wrap(~variable)
+ggsave(paste0(prj_dir, "out/fig/figE5_TM_child_inc_var.png"))
+```
+
+### 0-income replacement
+
+```{r figB8}
+figB8 <- inc_def %>%
+  filter(parents_var == "family_income_n" & child_var != "household_wage") %>%
+  mutate(i = row_number()) %>% group_by(i) %>%
+  mutate(subsample = paste0(unlist(subsample), collapse = "")) %>%
+  ungroup() %>% select(-i) %>%
+  mutate(lb = coef - qt(.975, df) * se,
+         ub = coef + qt(.975, df) * se,
+         lab = round(coef, 2)) %>%
+  select(n = N, estimator, subsample, replace0, child_var, coef, lab, lb, ub) %>%
+  arrange(n)
+fwrite(figB8, paste0(prj_dir, "out/fig/figB8_0_replacement.csv"))
+
+ggplot(figB8, aes(x = subsample, y = coef, fill = factor(replace0), label = lab)) + 
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_errorbar(aes(ymin = lb, ymax = ub), position = "dodge") +
+  geom_text() + facet_grid(estimator~child_var, scales = "free_x")
+ggsave(paste0(prj_dir, "out/fig/figB8_0_replacement.png"))
+```
+
+## Higher education
+
+### Conditional expectation
+
+```{r fig3}
+in_text_figures <- in_text_figures %>%
+  rbind(children %>%
+          .[!is.na(family_income_n_household_income_rank), 
+            .(Label = "Observed educ", Figure = mean(!is.na(college)), N = .N)])
+
+# First stage
+fs_no_educ <- first_stage(factor_instru = c("cbirth", "cs2_90", "type_fam"))
+
+# Add predictions
+children_no_educ <- copy(children) %>%
+  .[, ":=" (mother_log_income = NULL, father_log_income = NULL)] %>%
+  merge.data.table(fs_no_educ[[1]], by = "ID_DIFF", all.x = T, all.y = T) %>%
+  .[, family_log_income_n := log((ifelse(is.na(mother_log_income), 
+                                       0, exp(mother_log_income)) +
+                                  ifelse(is.na(father_log_income), 
+                                         0, exp(father_log_income))) /
+                                 (as.numeric(!is.na(mother_log_income)) +
+                                    as.numeric(!is.na(father_log_income))))] %>%
+  .[ , family_income_n := exp(family_log_income_n)] %>%
+  # Identify "incoherent" family structures
+  .[ , missing_parent := ifelse((
+    is.na(father_log_income) & !type_fam %in% c(
+      "Both parents (mother active only)", "Mother only")) | 
+      (is.na(mother_log_income) & !type_fam %in% c(
+        "Both parents (father active only)", "Father only")), 1, 0)]  %>%
+  # Trim 
+  gen_ranks("household_income", "family_income_n")
+
+
+fig3 <- children_no_educ %>%
+  filter(!is.na(family_income_n_household_income_rank)) %>%
+  group_by(family_income_n_household_income_rank) %>%
+  summarise(n = n(), child_edu = mean(college, na.rm = T)) %>%
+  select(n, family_rank = family_income_n_household_income_rank, child_edu) %>%
+  arrange(n)
+fwrite(fig3, paste0(prj_dir, "out/fig/fig3_higher_edu_cef.csv"))
+
+ggplot(fig3, aes(x = family_rank, y = child_edu)) +
+  geom_point(alpha = .5) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2)) +
+  scale_y_continuous(limits = c(0, 1), breaks = c(0, .25, .5, .75, 1))
+ggsave(paste0(prj_dir, "out/fig/fig3_higher_edu_cef.png"))
+
+
+fig_edu_sum <- children_no_educ %>%
+  filter(!is.na(family_income_household_income_rank)) %>%
+  group_by(family_income_household_income_rank) %>%
+  summarise(n = n(), child_edu = mean(college, na.rm = T)) %>%
+  select(n, family_rank = family_income_household_income_rank, child_edu) %>%
+  arrange(n)
+fwrite(fig_edu_sum, paste0(prj_dir, "out/fig/fig_edu_sum.csv"))
+
+ggplot(fig_edu_sum, aes(x = family_rank, y = child_edu)) +
+  geom_point(alpha = .5) + 
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2)) +
+  scale_y_continuous(limits = c(0, 1), breaks = c(0, .25, .5, .75, 1))
+ggsave(paste0(prj_dir, "out/fig/fig_edu_sum.png"))
+```
+
+### By transition matrix cell
+
+```{r figE7}
+figE7 <- children_no_educ %>%
+  filter(!is.na(family_income_n_household_income_rank)) %>% 
+  mutate(family_quintile = as.numeric(cut(family_income_n_household_income_rank, 
+                                          breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+  mutate(child_quintile = as.numeric(cut(household_income_family_income_n_rank, 
+                                         breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+  group_by(family_quintile, child_quintile) %>%
+  summarise(n = n(), pct = round(100 * mean(college, na.rm = T), 1)) %>%
+  select(n, family_quintile, child_quintile, pct) %>%
+  arrange(n)
+
+
+fwrite(figE7, paste0(prj_dir, "out/fig/figE7_higher_edu_tm.csv"))
+
+ggplot(figE7, aes(x = family_quintile, y = child_quintile, label = pct)) + geom_text()
+ggsave(paste0(prj_dir, "out/fig/figE7_higher_edu_tm.png"))
+
+fig_edu_sum_tm <- children_no_educ %>%
+  filter(!is.na(family_income_household_income_rank)) %>% 
+  mutate(family_quintile = as.numeric(cut(family_income_household_income_rank, 
+                                          breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+  mutate(child_quintile = as.numeric(cut(household_income_family_income_rank, 
+                                         breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+  group_by(family_quintile, child_quintile) %>%
+  summarise(n = n(), pct = round(100 * mean(college, na.rm = T), 1)) %>%
+  select(n, family_quintile, child_quintile, pct) %>%
+  arrange(n)
+
+
+fwrite(fig_edu_sum_tm, paste0(prj_dir, "out/fig/fig_edu_sum_tm.csv"))
+
+ggplot(fig_edu_sum_tm, aes(x = family_quintile, y = child_quintile, label = pct)) + geom_text()
+ggsave(paste0(prj_dir, "out/fig/fig_edu_sum_tm.png"))
+```
+
+# Robustness
+
+## Children
+
+### Lifecycle bias
+
+```{r fig4}
+for (i in 20:43) {
+  children <- gen_ranks(children, paste0("netinc_age_", i), "family_income_n")
+}
+
+# From All Employee Panel
+child_lifecycle_AEP <- lapply(20:43, function(age) {
+  
+  ige <- summary(lm(paste0("log(netinc_age_", age, ") ~ family_log_income_n",
+                           ifelse(age < 43, "+ factor(birth_year)", "")), 
+                    children[constant_sample & missing_parent == 0 & get(paste0("netinc_age_", age)) > 0]))
+  
+  rrc <- summary(lm(paste0("netinc_age_", age, 
+                           "_family_income_n_rank ~ family_income_n_netinc_age_", age, "_rank",
+                           ifelse(age < 43, "+ factor(birth_year)", "")), children))
+  
+  tm <- children %>% 
+    filter(!is.na(get(paste0("family_income_n_netinc_age_", age, "_rank")))) %>% 
+    mutate(family_quintile = as.numeric(cut(get(paste0("family_income_n_netinc_age_", age, "_rank")), 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(get(paste0("netinc_age_", age, "_family_income_n_rank")), 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+  
+  return(data.table(sample = rep("All Employee Panel", 6), 
+                    age = age,
+                    estimate = c("IGE", "RRC", rep("TM", 4)),
+                    group = c(rep("IGE/RRC", 2), "Bot->Bot", "Bot->Top",
+                              "Top->Bot", "Top->Top"),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], rep(NA, 4)),
+                    df = c(ige$df[2], rrc$df[2], rep(NA, 4)),
+                    N = c(length(ige$residuals), rep(length(rrc$residuals), 5))))
+
+}) %>% rbindlist()
+
+# From tax data
+for (i in 29:44) {
+  children <- gen_ranks(children, paste0("revtotnonpsocm_real_age_", i), "family_income_n")
+}
+
+child_lifecycle_tax <- lapply(29:44, function(age) {
+  
+  ige <- summary(lm(paste0("log(revtotnonpsocm_real_age_", age, ") ~ family_log_income_n",
+                           ifelse(!age %in% c(29, 44), "+ factor(birth_year)", "")), 
+                    children[constant_sample & missing_parent == 0 & get(paste0("revtotnonpsocm_real_age_", age)) > 0]))
+  
+  rrc <- summary(lm(paste0("revtotnonpsocm_real_age_", age, 
+                           "_family_income_n_rank ~ family_income_n_revtotnonpsocm_real_age_", age, "_rank",
+                           ifelse(!age %in% c(29, 44), "+ factor(birth_year)", "")), children))
+  
+  tm <- children %>% 
+    filter(!is.na(get(paste0("family_income_n_revtotnonpsocm_real_age_", age, "_rank")))) %>% 
+    mutate(family_quintile = as.numeric(cut(get(paste0("family_income_n_revtotnonpsocm_real_age_", age, "_rank")), 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(get(paste0("revtotnonpsocm_real_age_", age, "_family_income_n_rank")), 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+  
+  return(data.table(sample = rep("Tax data", 6), 
+                    age = age,
+                    estimate = c("IGE", "RRC", rep("TM", 4)),
+                    group = c(rep("IGE/RRC", 2), "Bot->Bot", "Bot->Top",
+                              "Top->Bot", "Top->Top"),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], rep(NA, 4)),
+                    df = c(ige$df[2], rrc$df[2], rep(NA, 4)),
+                    N = c(length(ige$residuals), rep(length(rrc$residuals), 5))))
+
+}) %>% rbindlist()
+
+fig4 <- rbind(child_lifecycle_AEP, child_lifecycle_tax) %>%
+  select(n = N, sample, age, estimate, group, coef, se, df) %>%
+  arrange(n)
+
+fwrite(fig4, paste0(prj_dir, "out/fig/fig4_child_lifecycle.csv"))
+
+ggplot(fig4, aes(x = age, y = coef, color = group, linetype = sample, shape = sample)) + 
+  geom_point() + geom_line() + facet_wrap(~estimate, nrow = 1, scales = "free")
+ggsave(paste0(prj_dir, "out/fig/fig4_child_lifecycle.png"))
+```
+
+### Lifecycle bias - Constant
+
+```{r figB4}
+child_lifecycle_1972 <- lapply(25:43, function(age) {
+  
+  ige <- summary(lm(paste0("log(netinc_age_", age, ") ~ family_log_income_n"), 
+                    children[constant_sample & birth_year == 1972 & n_netinc_25_43 == 19 & 
+                               missing_parent == 0 & get(paste0("netinc_age_", age)) > 0]))
+  
+  rrc <- summary(lm(paste0("netinc_age_", age, 
+                           "_family_income_n_rank ~ family_income_n_netinc_age_", age, "_rank"), 
+                    children[birth_year == 1972 & n_netinc_25_43 == 19] %>%
+                      gen_ranks(paste0("netinc_age_", age), "family_income_n")))
+  
+  tm <- children[birth_year == 1972 & n_netinc_25_43 == 19] %>%
+    gen_ranks(paste0("netinc_age_", age), "family_income_n") %>%
+    filter(!is.na(get(paste0("family_income_n_netinc_age_", age, "_rank")))) %>% 
+    mutate(family_quintile = as.numeric(cut(get(paste0("family_income_n_netinc_age_", age, "_rank")), 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(get(paste0("netinc_age_", age, "_family_income_n_rank")), 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+  
+  return(data.table(age = age,
+                    sample = "1972",
+                    estimate = c("IGE", "RRC", rep("TM", 4)),
+                    group = c(rep("IGE/RRC", 2), "Bot->Bot", "Bot->Top",
+                              "Top->Bot", "Top->Top"),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], rep(NA, 4)),
+                    df = c(ige$df[2], rrc$df[2], rep(NA, 4)),
+                    N = c(length(ige$residuals), rep(length(rrc$residuals), 5))))
+
+}) %>% rbindlist()
+
+child_lifecycle_1974 <- lapply(25:41, function(age) {
+  
+  ige <- summary(lm(paste0("log(netinc_age_", age, ") ~ family_log_income_n"), 
+                    children[constant_sample & birth_year == 1974 & n_netinc_25_43 == 17 & 
+                               missing_parent == 0 & get(paste0("netinc_age_", age)) > 0]))
+  
+  rrc <- summary(lm(paste0("netinc_age_", age, 
+                           "_family_income_n_rank ~ family_income_n_netinc_age_", age, "_rank"), 
+                    children[birth_year == 1974 & n_netinc_25_43 == 17] %>%
+                      gen_ranks(paste0("netinc_age_", age), "family_income_n")))
+  
+  tm <- children[birth_year == 1974 & n_netinc_25_43 == 17] %>%
+    gen_ranks(paste0("netinc_age_", age), "family_income_n") %>%
+    filter(!is.na(get(paste0("family_income_n_netinc_age_", age, "_rank")))) %>% 
+    mutate(family_quintile = as.numeric(cut(get(paste0("family_income_n_netinc_age_", age, "_rank")), 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(get(paste0("netinc_age_", age, "_family_income_n_rank")), 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+  
+  return(data.table(age = age,
+                    sample = "1974",
+                    estimate = c("IGE", "RRC", rep("TM", 4)),
+                    group = c(rep("IGE/RRC", 2), "Bot->Bot", "Bot->Top",
+                              "Top->Bot", "Top->Top"),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], rep(NA, 4)),
+                    df = c(ige$df[2], rrc$df[2], rep(NA, 4)),
+                    N = c(length(ige$residuals), rep(length(rrc$residuals), 5))))
+
+}) %>% rbindlist()
+
+figB4 <- rbind(child_lifecycle_1972, child_lifecycle_1974) %>%
+  select(n = N, age, sample, estimate, group, coef, se, df) %>%
+  arrange(n)
+fwrite(figB4, paste0(prj_dir, "out/fig/figB4_child_lifecycle_constant.csv"))
+
+ggplot(figB4, aes(x = age, y = coef, color = group, linetype = sample, shape = sample)) + 
+  geom_point() + geom_line() + facet_wrap(~estimate, nrow = 1, scales = "free")
+ggsave(paste0(prj_dir, "out/fig/figB4_child_lifecycle_constant.png"))
+```
+
+### Number of observations
+
+```{r figB6}
+figB6 <- lapply(1:7, function(n_obs) {
+
+  # Run first stage with designated dependent variable
+  temp_dat <- copy(children) %>%
+    .[, household_income := get(paste0("avg_revtotnonpsocm_real_centered_", n_obs))] %>%
+    .[household_income > 0, household_log_income := log(household_income)] %>%
+    # Compute ranks
+    gen_ranks("household_income", "family_income_n")
+  
+  ige <- summary(lm(household_log_income ~ family_log_income_n + factor(birth_year), 
+                    temp_dat[constant_sample & missing_parent == 0]))
+  
+  rrc <- summary(lm(household_income_family_income_n_rank ~ family_income_n_household_income_rank + factor(birth_year), temp_dat))
+  
+  tm <- temp_dat %>% 
+    filter(!is.na(family_income_n_household_income_rank)) %>% 
+    mutate(family_quintile = as.numeric(cut(family_income_n_household_income_rank, 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(household_income_family_income_n_rank, 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+    
+  return(data.table(n_obs = n_obs,
+                    estimate = c("IGE", "RRC", rep("TM", 4)),
+                    group = c(rep("IGE/RRC", 2), "Bot->Bot", "Bot->Top",
+                              "Top->Bot", "Top->Top"),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], rep(NA, 4)),
+                    df = c(ige$df[2], rrc$df[2], rep(NA, 4)),
+                    N = c(length(ige$residuals), rep(length(rrc$residuals), 5))))
+  
+}) %>% rbindlist() %>%
+  select(n = N, n_obs, estimate, group, coef, se, df) %>%
+  arrange(n)
+fwrite(figB6, paste0(prj_dir, "out/fig/figB6_child_n_inc_observations.csv"))
+
+ggplot(figB6,aes(x = n_obs, y = coef, color = group)) +
+  geom_point() + geom_line() + facet_wrap(~estimate, nrow = 1, scales = "fixed")
+ggsave(paste0(prj_dir, "out/fig/figB6_child_n_inc_observations.png"))
+```
+
+## Parents
+
+### Lifecycle bias
+
+```{r fig5}
+fig5 <- lapply(25:60, function(age) {
+
+  # Run first stage with designated dependent variable
+  temp_dat <- merge.data.table(children[, .(ID_DIFF, birth_year, type_fam, missing_parent, 
+                                            household_log_income, household_income, constant_sample)], 
+                               first_stage(parents_inc = paste0("netinc_", age), min_inc_obs = 0)[[1]], 
+                               by = "ID_DIFF", all.x = T, all.y = T) %>%
+    # Compute family income
+    .[, family_log_income_n := log((ifelse(is.na(mother_log_income), 
+                                         0, exp(mother_log_income)) +
+                                    ifelse(is.na(father_log_income), 
+                                           0, exp(father_log_income))) /
+                                   (as.numeric(!is.na(mother_log_income)) +
+                                      as.numeric(!is.na(father_log_income))))] %>%
+    .[ , family_income_n := exp(family_log_income_n)]  %>%
+    # Identify "incoherent" family structures
+    .[ , missing_parent := ifelse((is.na(father_log_income) & !type_fam %in% c("Both parents (mother active only)", "Mother only")) | 
+                           (is.na(mother_log_income) & !type_fam %in% c("Both parents (father active only)", "Father only")), 1, 0)] %>%
+    # Compute ranks
+    gen_ranks("household_income", "family_income_n")
+  
+  ige <- summary(lm(household_log_income ~ family_log_income_n + factor(birth_year), 
+                    temp_dat[constant_sample & missing_parent == 0]))
+  
+  rrc <- summary(lm(household_income_family_income_n_rank ~ family_income_n_household_income_rank + factor(birth_year), temp_dat))
+  
+  tm <- temp_dat %>% 
+    filter(!is.na(family_income_n_household_income_rank)) %>% 
+    mutate(family_quintile = as.numeric(cut(family_income_n_household_income_rank, 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(household_income_family_income_n_rank, 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+    
+  return(data.table(age = age,
+                    estimate = c("IGE", "RRC", rep("TM", 4)),
+                    group = c(rep("IGE/RRC", 2), "Bot->Bot", "Bot->Top",
+                              "Top->Bot", "Top->Top"),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], rep(NA, 4)),
+                    df = c(ige$df[2], rrc$df[2], rep(NA, 4)),
+                    N = c(length(ige$residuals), rep(length(rrc$residuals), 5))))
+  
+}) %>% rbindlist() %>%
+  select(n = N, age, estimate, group, coef, se, df) %>%
+  arrange(n)
+fwrite(fig5, paste0(prj_dir, "out/fig/fig5_parents_lifecycle.csv"))
+
+ggplot(fig5, aes(x = age, y = coef, color = group)) +
+  geom_point() + geom_line() + facet_wrap(~estimate, nrow = 1, scales = "free")
+ggsave(paste0(prj_dir, "out/fig/fig5_parents_lifecycle.png"))
+```
+
+### Attenuation bias
+
+```{r}
+restrictions <- data.table(nobs = rep(1:11, 2),
+                           sample = rep(c("Moving", "Constant"), each = 11))
+
+parents_attenuation <- lapply(1:nrow(restrictions), function(x) {
+
+  # Run first stage with designated dependent variable
+  temp_dat <- merge.data.table(children[, .(ID_DIFF, birth_year, type_fam, missing_parent, 
+                                            household_log_income, household_income, constant_sample)], 
+                               first_stage(parents_inc = paste0("avg_netinc_40_", restrictions$nobs[x]), 
+                                           min_inc_obs_var = ifelse(restrictions$sample[x] == "Constant", 
+                                                                    "avg_netinc_40_11", "n_netinc_3545"),
+                                           min_inc_obs = 0)[[1]], 
+                               by = "ID_DIFF", all.x = T, all.y = T) %>%
+    # Compute family income
+    .[, family_log_income_n := log((ifelse(is.na(mother_log_income), 
+                                         0, exp(mother_log_income)) +
+                                    ifelse(is.na(father_log_income), 
+                                           0, exp(father_log_income))) /
+                                   (as.numeric(!is.na(mother_log_income)) +
+                                      as.numeric(!is.na(father_log_income))))] %>%
+    .[ , ":=" (family_income_n = exp(family_log_income_n),
+               father_income = exp(father_log_income))]  %>%
+    # Identify "incoherent" family structures
+    .[ , missing_parent := ifelse((is.na(father_log_income) & !type_fam %in% c("Both parents (mother active only)", "Mother only")) | 
+                           (is.na(mother_log_income) & !type_fam %in% c("Both parents (father active only)", "Father only")), 1, 0)] %>%
+    # Compute ranks
+    gen_ranks("household_income", "family_income_n") %>%
+    gen_ranks("household_income", "father_income")
+  
+  ige <- summary(lm(household_log_income ~ family_log_income_n + factor(birth_year), 
+                    temp_dat[constant_sample & missing_parent == 0]))
+  ige_father <- summary(lm(household_log_income ~ father_log_income + factor(birth_year), 
+                           temp_dat[constant_sample & missing_parent == 0]))
+  
+  rrc <- summary(lm(household_income_family_income_n_rank ~ family_income_n_household_income_rank + factor(birth_year), temp_dat))
+  rrc_father <- summary(lm(household_income_father_income_rank ~ father_income_household_income_rank + factor(birth_year), temp_dat))
+  
+  tm <- temp_dat %>% 
+    filter(!is.na(family_income_n_household_income_rank)) %>% 
+    mutate(family_quintile = as.numeric(cut(family_income_n_household_income_rank, 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(household_income_family_income_n_rank, 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+  tm_father <- temp_dat %>% 
+    filter(!is.na(father_income_household_income_rank)) %>% 
+    mutate(family_quintile = as.numeric(cut(father_income_household_income_rank, 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(household_income_father_income_rank, 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+    
+  return(data.table(nobs = restrictions$nobs[x],
+                    sample = restrictions$sample[x],
+                    parent_var = rep(c("family", "father"), each = 6),
+                    estimate = rep(c("IGE", "RRC", rep("TM", 4)), 2),
+                    group = rep(c(rep("IGE/RRC", 2), "Bot->Bot", "Bot->Top",
+                              "Top->Bot", "Top->Top"), 2),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 5), share),
+                             ige_father$coefficients[2, 1],  rrc_father$coefficients[2, 1],
+                             pull(filter(tm_father, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm_father, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm_father, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm_father, family_quintile == 5 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], rep(NA, 4),
+                           ige_father$coefficients[2, 2], rrc_father$coefficients[2, 2], rep(NA, 4)),
+                    df = c(ige$df[2], rrc$df[2], rep(NA, 4), ige_father$df[2], rrc_father$df[2], rep(NA, 4)),
+                    N = c(length(ige$residuals), rep(length(rrc$residuals), 5),
+                          length(ige_father$residuals), rep(length(rrc_father$residuals), 5))))
+  
+}) %>% rbindlist()
+```
+
+```{r fig6}
+fig6 <- parents_attenuation %>% 
+  filter(sample == "Moving") %>% 
+  select(n = N, nobs, parent_var, estimate, group, coef, se, df) %>%
+  arrange(n)
+
+fwrite(fig6, paste0(prj_dir, "out/fig/fig6_parents_attenuation.csv"))
+
+ggplot(fig6, aes(x = nobs, y = coef, color = group, linetype = parent_var)) +
+  geom_point() + geom_line() + facet_wrap(~estimate, nrow = 1)
+ggsave(paste0(prj_dir, "out/fig/fig6_parents_attenuation.png"))
+```
+
+### Attenuation bias - Constant
+
+```{r figB7}
+figB7 <- parents_attenuation %>% filter(sample == "Constant") %>% 
+  select(n = N, nobs, parent_var, estimate, group, coef, se, df) %>%
+  arrange(n)
+fwrite(figB7, paste0(prj_dir, "out/fig/figB7_parents_attenuation_constant.csv"))
+
+ggplot(figB7, aes(x = nobs, y = coef, color = group, linetype = parent_var)) +
+  geom_point() + geom_line() + facet_wrap(~estimate, nrow = 1)
+ggsave(paste0(prj_dir, "out/fig/figB7_parents_attenuation_constant.png"))
+```
+
+### Post-1988 income
+
+```{r figB1}
+restrictions <- data.table(group = rep(c("", "_post_88"), 3),
+                           subsample = rep(c(list(c("F", "M")), "F", "M"), each = 2))
+
+figB1 <- lapply(1:6, function(i) {
+  
+  # Run first stage with designated dependent variable
+  temp_dat <- merge.data.table(children[, .(ID_DIFF, birth_year, gender, type_fam, missing_parent, 
+                                            constant_sample, household_log_income, household_income)], 
+                               first_stage(parents_inc = paste0("avg_netinc_3545", restrictions$group[i]), 
+                                           min_inc_obs_var = paste0("n_netinc_3545", restrictions$group[i]), 
+                                           min_inc_obs = 2)[[1]], 
+                               by = "ID_DIFF", all.x = T, all.y = T) %>%
+    # Compute family income
+    .[, family_log_income_n := log((ifelse(is.na(mother_log_income), 
+                                         0, exp(mother_log_income)) +
+                                    ifelse(is.na(father_log_income), 
+                                           0, exp(father_log_income))) /
+                                   (as.numeric(!is.na(mother_log_income)) +
+                                      as.numeric(!is.na(father_log_income))))] %>%
+    .[ , family_income_n := exp(family_log_income_n)]  %>%
+    # Identify "incoherent" family structures
+    .[ , missing_parent := ifelse((is.na(father_log_income) & !type_fam %in% c("Both parents (mother active only)", "Mother only")) | 
+                           (is.na(mother_log_income) & !type_fam %in% c("Both parents (father active only)", "Father only")), 1, 0)] %>%
+    # Compute ranks
+    gen_ranks("household_income", "family_income_n")
+  
+  ige <- summary(lm(household_log_income ~ family_log_income_n + factor(birth_year), 
+                    temp_dat[constant_sample & missing_parent == 0][gender %in% unlist(restrictions$subsample[i])]))
+  
+  rrc <- summary(lm(household_income_family_income_n_rank ~ family_income_n_household_income_rank + factor(birth_year), temp_dat[gender %in% unlist(restrictions$subsample[i])]))
+  
+  tm <- temp_dat %>% 
+    filter(!is.na(family_income_n_household_income_rank)) %>% 
+    mutate(family_quintile = as.numeric(cut(family_income_n_household_income_rank, 
+                                            breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    mutate(child_quintile = as.numeric(cut(household_income_family_income_n_rank, 
+                                           breaks = seq(0, 100, 20), na.rm = TRUE))) %>%
+    select(child_quintile, family_quintile) %>%
+    group_by(family_quintile) %>%
+    mutate(n_bar = n()) %>%
+    group_by(family_quintile, child_quintile) %>%
+    summarise(share = n() / unique(n_bar)) 
+  
+  return(data.table(inc_period = restrictions$group[i],
+                    subsample = restrictions$subsample[i],
+                    estimate = c("IGE", "RRC", rep("TM", 4)),
+                    group = c(rep("IGE/RRC", 2), "Bot->Bot", "Bot->Top",
+                              "Top->Bot", "Top->Top"),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1],
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 1 & child_quintile == 5), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 1), share),
+                             pull(filter(tm, family_quintile == 5 & child_quintile == 5), share)),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2], rep(NA, 4)),
+                    df = c(ige$df[2], rrc$df[2], rep(NA, 4)),
+                    N = c(length(ige$residuals), rep(length(rrc$residuals), 5))))
+  
+}) %>% rbindlist()
+
+figB1 <- figB1 %>%
+  select(n = N, inc_period, subsample, estimate, group, coef, se, df) %>%
+  arrange(n) %>%
+  group_by(row_number()) %>%
+  mutate(subsample = paste0(unlist(subsample), collapse = ""),
+         lab = ifelse(estimate == "TM", 100 * round(coef, 3), round(coef, 2)))
+fwrite(figB1, paste0(prj_dir, "out/fig/figB1_post_88_income.csv"))
+
+ggplot(figB1, aes(x = subsample, y = coef, fill = group, color = inc_period, label = lab)) +
+  geom_bar(stat = "identity", position = "dodge") + geom_text() +
+  facet_wrap(~estimate, nrow = 1, scales = "free")
+ggsave(paste0(prj_dir, "out/fig/figB1_post_88_income.png"))
+```
+
+## Joint lifecycle bias
+
+```{r figB5}
+Sys.time()
+figB5 <- lapply(25:60, function(age) {
+  
+  # Run first stage with designated dependent variable
+  temp_dat <- merge.data.table(children[, .SD, .SDcols = c("ID_DIFF", "birth_year", "type_fam", 
+                                                           "constant_sample", "missing_parent", 
+                                                           paste0("revtotnonpsocm_real_age_", 29:44))], 
+                               first_stage(parents_inc = paste0("netinc_", age), min_inc_obs = 0)[[1]], 
+                               by = "ID_DIFF", all.x = T, all.y = T) %>%
+    # Compute family income
+    .[, family_log_income_n := log((ifelse(is.na(mother_log_income), 
+                                         0, exp(mother_log_income)) +
+                                    ifelse(is.na(father_log_income), 
+                                           0, exp(father_log_income))) /
+                                   (as.numeric(!is.na(mother_log_income)) +
+                                      as.numeric(!is.na(father_log_income))))] %>%
+    .[ , family_income_n := exp(family_log_income_n)]  %>%
+    # Identify "incoherent" family structures
+    .[ , missing_parent := ifelse((is.na(father_log_income) & !type_fam %in% c("Both parents (mother active only)", "Mother only")) | 
+                           (is.na(mother_log_income) & !type_fam %in% c("Both parents (father active only)", "Father only")), 1, 0)]
+  
+  return(lapply(29:44, function(age_child) {
+    
+    # Compute ranks
+    temp_dat <- temp_dat %>%
+      .[, household_income := get(paste0("revtotnonpsocm_real_age_", age_child))] %>%
+      .[, household_log_income := ifelse(household_income > 0, log(household_income), NA)] %>%
+      gen_ranks("household_income", "family_income_n")
+    
+    ige <- summary(lm(paste0("household_log_income ~ family_log_income_n", 
+                             ifelse(!age_child %in% c(29, 44), "+factor(birth_year)", "")), 
+                             temp_dat[constant_sample & missing_parent == 0]))
+                   
+    rrc <- summary(lm(paste0("household_income_family_income_n_rank ~ family_income_n_household_income_rank", 
+                             ifelse(!age_child %in% c(29, 44), "+factor(birth_year)", "")), 
+                             temp_dat))
+    
+    return(data.table(parents_age = age,
+                      child_age = age_child,
+                      estimate = c("IGE", "RRC"),
+                      coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1]),
+                      se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2]),
+                      df = c(ige$df[2], rrc$df[2]),
+                      N = c(length(ige$residuals), length(rrc$residuals))))
+    
+  }) %>% rbindlist())
+  
+}) %>% rbindlist()
+
+figB5A <- figB5[estimate == "IGE", ] %>%
+  select(n = N, parents_age, child_age, coef, se, df) %>%
+  arrange(n)
+
+fwrite(figB5A, paste0(prj_dir, "out/fig/figB5A_IGE_joint_lifetime_income.csv"))
+
+scatter3D(x = figB5A[["parents_age"]], y = figB5A[["child_age"]], z = figB5A[["coef"]],
+          pch = 0, cex = 0, bty = "b2", theta = -30, phi = 25, ticktype = "detailed", 
+          d = 200, xlab = "Parent age", ylab = "Child age", zlab = "", zlim = c(0,.6), 
+          surf = list(x = 25:60, y = 29:44, z = figB5A[, .(parents_age, child_age, coef)] %>%
+                        pivot_wider(names_from = "child_age", values_from = "coef") %>% 
+                        select(-parents_age) %>% as.matrix(), facets = T, border = "black"), 
+          cex.lab = 4, cex.axis = 4, colkey = list(cex.axis = 4))
+ggsave(paste0(prj_dir, "out/fig/figB5A_IGE_joint_lifetime_income.png"))
+
+figB5B <- figB5[estimate == "RRC", ] %>%
+  select(n = N, parents_age, child_age, coef, se, df) %>%
+  arrange(n)
+fwrite(figB5B, paste0(prj_dir, "out/fig/figB5B_RRC_joint_lifetime_income.csv"))
+
+scatter3D(x = figB5B[["parents_age"]], y = figB5B[["child_age"]], z = figB5B[["coef"]],
+          pch = 0, cex = 0, bty = "b2", theta = -30, phi = 25, ticktype = "detailed", 
+          d = 200, xlab = "Parent age", ylab = "Child age", zlab = "", zlim = c(0,.4), 
+          surf = list(x = 25:60, y = 29:44, z = figB5B[, .(parents_age, child_age, coef)] %>%
+                        pivot_wider(names_from = "child_age", values_from = "coef") %>% 
+                        select(-parents_age) %>% as.matrix(), facets = T, border = "black"), 
+          cex.lab = 4, cex.axis = 4, colkey = list(cex.axis = 4))
+ggsave(paste0(prj_dir, "out/fig/figB5B_RRC_joint_lifetime_income.png"))
+Sys.time()
+```
+
+## Income tails trimming
+
+```{r figB9}
+restrictions <- data.table(top = rep(c(0, 1:5/100, .1), 7),
+                           bot = rep(c(0, 1:5/100, .1), each = 7))
+
+restrictions <- rbind(restrictions %>% mutate(trim = "First stage"),
+                      restrictions %>% mutate(trim = "Second stage"),
+                      restrictions %>% mutate(trim = "Children"))
+
+figB9 <- lapply(1:nrow(restrictions), function(x) {
+  
+  # Run first stage with designated dependent variable
+  temp_dat <- merge.data.table(children[, .(ID_DIFF, birth_year, type_fam, missing_parent, 
+                                            constant_sample, household_income, household_log_income)], 
+                               first_stage(remove_bottom = ifelse(restrictions$trim[x] == "First stage", restrictions$bot[x], 0),
+                                           remove_top = ifelse(restrictions$trim[x] == "First stage", restrictions$top[x], 0))[[1]], 
+                               by = "ID_DIFF", all.x = T, all.y = T) %>%
+    # Compute family income
+    .[, family_log_income_n := log((ifelse(is.na(mother_log_income), 
+                                         0, exp(mother_log_income)) +
+                                    ifelse(is.na(father_log_income), 
+                                           0, exp(father_log_income))) /
+                                   (as.numeric(!is.na(mother_log_income)) +
+                                      as.numeric(!is.na(father_log_income))))] %>%
+    .[ , family_income_n := exp(family_log_income_n)] %>%
+    # Identify "incoherent" family structures
+    .[ , missing_parent := ifelse((is.na(father_log_income) & !type_fam %in% c("Both parents (mother active only)", "Mother only")) | 
+                           (is.na(mother_log_income) & !type_fam %in% c("Both parents (father active only)", "Father only")), 1, 0)]  %>%
+    # Trim 
+    gen_ranks("household_income", "family_income_n")  %>%
+    .[constant_sample == F | missing_parent == 1, ":=" (family_log_income_n = NA, family_income_n = NA, household_log_income = NA, household_income = NA)] %>%
+    
+    
+    .[family_income_n < quantile(family_income_n, ifelse(restrictions$trim[x] == "Second stage", 
+                                                    restrictions$bot[x], 0), na.rm = TRUE) |
+        family_income_n > quantile(family_income_n, ifelse(restrictions$trim[x] == "Second stage", 
+                                                        1 - restrictions$top[x], 1), na.rm = TRUE),
+      ":=" (family_income_n = NA, family_income_n_child_income_rank = NA)] %>%
+    
+    
+    
+    .[family_log_income_n < quantile(family_log_income_n, ifelse(restrictions$trim[x] == "Second stage", 
+                                                    restrictions$bot[x], 0), na.rm = TRUE) |
+        family_log_income_n > quantile(family_log_income_n, ifelse(restrictions$trim[x] == "Second stage", 
+                                                        1 - restrictions$top[x], 1), na.rm = TRUE),
+      family_log_income_n := NA] %>%
+    
+    
+    .[is.na(family_log_income_n) | household_income < quantile(household_income, ifelse(restrictions$trim[x] == "Children", 
+                                                    restrictions$bot[x], 0), na.rm = TRUE) | 
+        household_income > quantile(household_income, ifelse(restrictions$trim[x] == "Children", 
+                                                        1 - restrictions$top[x], 1), na.rm = TRUE),
+      ":=" (household_income = NA, household_income_family_income_n_rank = NA)] %>%
+    
+    
+    .[household_log_income < quantile(household_log_income, ifelse(restrictions$trim[x] == "Children", 
+                                                    restrictions$bot[x], 0), na.rm = TRUE) | 
+        household_log_income > quantile(household_log_income, ifelse(restrictions$trim[x] == "Children", 
+                                                        1 - restrictions$top[x], 1), na.rm = TRUE),
+      household_log_income := NA]
+  
+  ige <- summary(lm(household_log_income ~ family_log_income_n + factor(birth_year), temp_dat))
+  
+  rrc <- summary(lm(household_income_family_income_n_rank ~ family_income_n_household_income_rank + factor(birth_year), temp_dat))
+  
+  return(data.table(trim = restrictions$trim[x],
+                    bot = restrictions$bot[x],
+                    top = restrictions$top[x],
+                    estimate = c("IGE", "RRC"),
+                    coef = c(ige$coefficients[2, 1],  rrc$coefficients[2, 1]),
+                    se = c(ige$coefficients[2, 2], rrc$coefficients[2, 2]),
+                    df = c(ige$df[2], rrc$df[2]),
+                    N = c(length(ige$residuals), length(rrc$residuals))))
+  
+}) %>% rbindlist()
+
+figB9 <- mutate(figB9, lab = round(coef, 3), top = rep(restrictions$top, each = 2)) %>%
+  select(n = N, trim, estimate, top, bot, coef, lab) %>%
+  arrange(n)
+fwrite(figB9, paste0(prj_dir, "out/fig/figB9_trimming.csv"))
+
+ggplot(figB9, aes(x = as.factor(bot), y = as.factor(top), fill = coef, label = lab)) +
+  geom_tile() + geom_text() + facet_grid(trim~estimate)
+ggsave(paste0(prj_dir, "out/fig/figB9_trimming.png"))
+```
+
+# Spatial
+
+```{r}
+geo_fs <- first_stage(numeric_instru = c("gender", "age_90", "born_french"))
+
+in_text_figures <- in_text_figures %>%
+  rbind(geo_fs[[2]] %>% .[, Label := paste("No geo FS R2", Label)])
+
+children <- children %>%
+  # Compute parent income without municipality characteristics in first stage
+  merge.data.table(geo_fs[[1]] %>%
+                     .[, .(ID_DIFF, mother_log_income_spatial = mother_log_income, 
+                           father_log_income_spatial = father_log_income)], 
+                   by = "ID_DIFF", all.x = T, all.y = T) %>%
+  # Compute family income
+  .[, family_log_income_n_spatial := log((ifelse(is.na(mother_log_income_spatial), 
+                                       0, exp(mother_log_income_spatial)) +
+                                  ifelse(is.na(father_log_income_spatial), 
+                                         0, exp(father_log_income_spatial))) /
+                                 (as.numeric(!is.na(mother_log_income_spatial)) +
+                                    as.numeric(!is.na(father_log_income_spatial))))] %>%
+  .[ , family_income_n_spatial := exp(family_log_income_n_spatial)] %>%
+  # Identify "incoherent" family structures
+  .[ , missing_parent_spatial := ifelse((is.na(father_log_income_spatial) & !type_fam %in% c("Both parents (mother active only)", "Mother only")) | 
+                         (is.na(mother_log_income_spatial) & !type_fam %in% c("Both parents (father active only)", "Father only")), 1, 0)] 
+
+# Generate ranks
+for (i in child_inc_vars) {children <- gen_ranks(children, i, "family_income_n_spatial")}
+```
+
+## Department-level IGM
+
+```{r}
+# Department results
+dep_igm <- lapply(1:95, function(x) {
+  
+  lapply(c("household_income", "individual_income", "labor_income"), function(i) {
+    
+    ige <- summary(lm(paste0("log(", i, ") ~ family_log_income_n_spatial"),
+                      children[get(i) > 0 & missing_parent_spatial == 0 & constant_sample & dep == x]))
+    
+    ige_with_geo <- summary(lm(paste0("log(", i, ") ~ family_log_income_n"),
+                               children[get(i) > 0 & missing_parent == 0 & constant_sample & dep == x]))
+    
+    rrc <- summary(lm(paste0(i, "_family_income_n_spatial_rank ~ family_income_n_spatial_",
+                             i, "_rank"), children[dep == x]))
+    
+    rrc_with_geo <- summary(lm(paste0(i, "_family_income_n_rank ~ family_income_n_",
+                                      i, "_rank"), children[dep == x]))
+    
+    return(data.table(dep = x, child_var = i,
+                      ige = ige$coefficients[2, 1],
+                      ige_with_geo = ige_with_geo$coefficients[2, 1],
+                      se_ige = ige$coefficients[2, 2],
+                      n_ige = length(ige$residuals),
+                      rrc = rrc$coefficients[2, 1],
+                      rrc_with_geo = rrc_with_geo$coefficients[2, 1],
+                      se_rrc = rrc$coefficients[2, 2],
+                      n_rrc = length(rrc$residuals), 
+                      aum = rrc$coefficients[1, 1] + 25*rrc$coefficients[2, 1],
+                      aum_with_geo = rrc_with_geo$coefficients[1, 1] + 
+                        25*rrc_with_geo$coefficients[2, 1]))
+  }) %>% rbindlist() %>% return()
+  
+}) %>% rbindlist()
+```
+
+### Local estimates
+
+```{r}
+in_text_figures <- in_text_figures %>%
+  rbind(data.table(Label = "Min cor dep with/out geo",
+                   Figure = dep_igm %>% .[n_rrc > 200] %>% 
+                     .[, .(ige = cor(ige, ige_with_geo),
+                           rrc = cor(rrc, rrc_with_geo),
+                           aum = cor(aum, aum_with_geo)), by = child_var] %>%
+                     pivot_longer(-child_var) %>% pull(value) %>% min(),
+                   N = nrow(distinct(dep_igm[n_rrc > 200, .(dep)]))))
+```
+
+
+```{r figE8}
+ggplot(dep_shp %>% mutate(centro = st_centroid(geometry))) +
+  geom_sf() + geom_sf_text(aes(geometry = centro, label = dep_lab))
+```
+
+```{r fig7}
+fig7 <- dep_igm %>%
+  .[n_rrc > 200 & child_var == "household_income", .(n = n_rrc, dep, ige, rrc, aum)] %>%
+  melt(id.vars = c("n", "dep"), measure.vars = c("ige", "rrc", "aum")) %>% 
+  .[, value := round(value, ifelse(variable == "aum", 1, 3))] %>%
+  .[order(variable, value), octile := ceiling(8 * ((1:.N)/.N)), by = variable] %>%
+  .[, lab := paste0(min(value), "-", max(value)), by = c("variable", "octile")] %>% 
+  dcast(n + dep ~ variable, value.var = "lab") %>%
+  arrange(n)
+
+fig7A <- fig7[, .(n, dep, ige)]
+fwrite(fig7A,  paste0(prj_dir, "out/fig/fig7A_ige_map.csv"))
+ggplot(full_join(dep_shp, fig7A), aes(fill = ige)) + geom_sf()
+ggsave(paste0(prj_dir, "out/fig/fig7A_ige_map.png"))
+
+fig7B <- fig7[, .(n, dep, rrc)]
+fwrite(fig7B,  paste0(prj_dir, "out/fig/fig7B_rrc_map.csv"))
+ggplot(full_join(dep_shp, fig7B), aes(fill = rrc)) + geom_sf()
+ggsave(paste0(prj_dir, "out/fig/fig7B_rrc_map.png"))
+
+fig7C <- fig7[, .(n, dep, aum)]
+fwrite(fig7C,  paste0(prj_dir, "out/fig/fig7C_aum_map.csv"))
+ggplot(full_join(dep_shp, fig7C), aes(fill = aum)) + geom_sf()
+ggsave(paste0(prj_dir, "out/fig/fig7C_aum_map.png"))
+```
+
+```{r figE12}
+figE12 <- dep_igm[n_rrc > 200 & child_var == "household_income"] %>%
+  mutate(lb = ige - se_ige * qt(.975, n_ige - 2),
+         ub = ige + se_ige * qt(.975, n_ige - 2)) %>%
+  left_join(dep_shp %>% st_drop_geometry() %>% select(dep, dep_lab)) %>%
+  mutate(coef = fig1A$coef[1]) %>%
+  select(n = n_rrc, dep_lab, ige, lb, ub, coef) %>%
+  arrange(n)
+fwrite(figE12,  paste0(prj_dir, "out/fig/figE12_sorted_ige.csv"))
+
+ggplot(figE12, aes(x = reorder(dep_lab, ige), y = ige, ymin = lb, ymax = ub)) +
+  geom_point() + geom_errorbar() + 
+  geom_hline(yintercept = figE12$coef[1], linetype = "dashed") + coord_flip()
+ggsave(paste0(prj_dir, "out/fig/figE12_sorted_ige.png"))
+```
+
+```{r figE13}
+figE13 <- dep_igm[n_rrc > 200 & child_var == "household_income"] %>%
+  mutate(lb = rrc - se_rrc * qt(.975, n_rrc - 2),
+         ub = rrc + se_rrc * qt(.975, n_rrc - 2)) %>%
+  left_join(dep_shp %>% st_drop_geometry() %>% select(dep, dep_lab)) %>%
+  mutate(coef = fig1B$coef[1]) %>%
+  select(n = n_rrc, dep_lab, rrc, lb, ub, coef) %>%
+  arrange(n)
+fwrite(figE13,  paste0(prj_dir, "out/fig/figE13_sorted_rrc.csv"))
+
+ggplot(figE13, aes(x = reorder(dep_lab, rrc), y = rrc, ymin = lb, ymax = ub)) +
+  geom_point() + geom_errorbar() + 
+  geom_hline(yintercept = figE13$coef[1], linetype = "dashed") + coord_flip()
+ggsave(paste0(prj_dir, "out/fig/figE13_sorted_rrc.png"))
+```
+
+```{r tabF9}
+tabF9 <- dep_igm %>% 
+  filter(child_var == "household_income") %>%
+  mutate(N = n_rrc,
+         rrc = ifelse(n_rrc < 200, NA, round(rrc, 2)), 
+         ige = ifelse(n_rrc < 200, NA, round(ige, 2)), 
+         aum = ifelse(n_rrc < 200, NA, round(aum, 1))) %>% 
+  select(dep, N, ige, rrc, aum)
+
+tabF9
+fwrite(tabF9, paste0(prj_dir, "out/tab/tabF9_dep_IGM.csv"))
+```
+
+### Correlation between measures
+
+```{r tabF10}
+tabF10 <- dep_igm[n_rrc >= 200, .(ige_rrc = cor(ige, rrc), 
+                                  rrc_aum = cor(rrc, aum), 
+                                  ige_aum = cor(ige, aum)),  by = "child_var"]
+
+tabF10
+fwrite(tabF10, paste0(prj_dir, "out/tab/tabF10_cor_IGM.csv"))
+```
+
+### Correlation with local MSE
+
+```{r tabF8}
+dep_igm <- merge.data.table(dep_igm, dep_mse, by = "dep", all.x = T)
+
+tabF8 <- list(lm(ige ~ mse, dep_igm[child_var == "household_income" & n_rrc >= 200]),
+              lm(rrc ~ mse, dep_igm[child_var == "household_income" & n_rrc >= 200]),
+              lm(aum ~ mse, dep_igm[child_var == "household_income" & n_rrc >= 200])) %>% 
+  stargazer(type = "latex", keep.stat = c("N", "rsq"), model.numbers = F)
+
+writeLines(tabF8, paste0(prj_dir, "out/tab/tabF8_cor_local_MSE_IGM.tex"))
+```
+
+## Department-level CEFs
+
+### Rank-cef/AUM in Nord
+
+```{r figE9}
+figE9 <- children %>%
+  .[!is.na(family_income_n_spatial_household_income_rank) & dep == 59, ] %>%
+   .[, .(n = .N, child_rank = mean(household_income_family_income_n_spatial_rank, na.rm = T)), 
+    by = c("family_income_n_spatial_household_income_rank")] %>%
+  .[, aum59 := dep_igm[dep == 59 & child_var == "household_income"]$aum] %>%
+  .[order(n), .(n, family_income_n_spatial_household_income_rank, child_rank, aum59)]
+fwrite(figE9,  paste0(prj_dir, "out/fig/figE9_Nord_cef.csv"))
+
+ggplot(figE9, aes(x = family_income_n_spatial_household_income_rank, y = child_rank)) +
+  geom_point() + geom_smooth(method = "lm", se = F) +
+  geom_segment(aes(x = 25, xend = 25, y = 1, yend = unique(figE9$aum59)), linetype = "dashed") +
+  geom_segment(aes(x = 1, xend = 25, y = unique(figE9$aum59), yend = unique(figE9$aum59)), linetype = "dashed") +
+  annotate("text", x = 5, y = 40, label = round(unique(figE9$aum59), 1)) +
+  scale_x_continuous(limits = c(1, 100)) +
+  scale_y_continuous(limits = c(1, 100))
+ggsave(paste0(prj_dir, "out/fig/figE9_Nord_cef.png"))
+```
+
+### Local ventile CEFs
+
+```{r}
+dep_cefs <- children %>%
+  .[, rank_dep := as.numeric(as.factor(-pop_dep))] %>%
+  .[!is.na(family_income_n_spatial_household_income_rank) & rank_dep < 33, ] %>% 
+  .[, family_ventile := ceiling(20 * (family_income_n_spatial_household_income_rank / 100))] %>%
+  .[, .(n = .N, child_rank = mean(household_income_family_income_n_spatial_rank, na.rm = T),
+        household_log_income = mean(household_log_income, na.rm = T),
+        family_log_income_n = mean(family_log_income_n_spatial, na.rm = T)), 
+    by = c("dep", "rank_dep", "family_ventile")]
+```
+
+```{r figE10}
+figE10 <- dep_cefs[order(n), .(n, dep, rank_dep, family_log_income_n, household_log_income)]
+fwrite(figE10,  paste0(prj_dir, "out/fig/figE10_local_log_cef.csv"))
+
+ggplot(figE10, aes(x = family_log_income_n, y = household_log_income)) +
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = F) +
+  facet_wrap(~reorder(dep, rank_dep), ncol = 4)
+ggsave(paste0(prj_dir, "out/fig/figE10_local_log_cef.png"))
+```
+
+```{r figE11}
+figE11 <- dep_cefs[order(n), .(n, dep, rank_dep, family_ventile, child_rank)]
+fwrite(figE11,  paste0(prj_dir, "out/fig/figE11_local_rank_cef.csv"))
+
+ggplot(figE11, aes(x = family_ventile, y = child_rank)) +
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x, 3), se = F) +
+  facet_wrap(~reorder(dep, rank_dep), ncol = 4)
+ggsave(paste0(prj_dir, "out/fig/figE11_local_rank_cef.png"))
+```
+
+## Department characteristics
+
+### Correlations
+
+```{r figD2}
+dep_vars <- c("density_dep", "single_dep", "foreign_dep", "unemp_dep", "lmean_wage_dep", 
+              "dist_edu_dep", "highschool_dep", "higher_edu_dep", "theil_dep", "sharetop1_dep", 
+              "gini_dep", "amenities_dep", "pct_crimes_dep", "participation_dep")
+
+dep_chars <- distinct(children[, .SD, .SDcols = c("dep", dep_vars)]) %>% na.omit() 
+
+cors <- data.table(var1 = rep(dep_vars, length(dep_vars)),
+                   var2 = rep(dep_vars, each = length(dep_vars)),
+                   order1 = rep(1:length(dep_vars), length(dep_vars)),
+                   order2 = rep(length(dep_vars):1, each = length(dep_vars)))
+
+dep_cor <- lapply(1:nrow(cors), function(x) {
+  cor(dep_chars[[cors$var1[x]]], dep_chars[[cors$var2[x]]])
+}) %>% unlist()
+
+figD2 <- cors %>%
+  .[, cor := dep_cor] %>% .[, lab := round(dep_cor, 2)] %>%
+  .[, .(n = 85, var1, var2, order1, order2, cor, lab)]
+fwrite(figD2,  paste0(prj_dir, "out/fig/figD2_dep_correlations.csv"))
+
+ggplot(figD2, aes(x = reorder(var1, order1), y = reorder(var2, order2), 
+                  fill = cor, label = lab)) + geom_tile() + geom_text()
+ggsave(paste0(prj_dir, "out/fig/figD2_dep_correlations.png"))
+```
+
+### Separate regressions
+
+```{r}
+dep_regs <- dep_igm[child_var == "household_income", .(dep, n_rrc, ige, rrc, aum)] %>%
+  left_join(dep_chars)
+
+dep_regs <- dep_regs %>%
+  .[n_rrc >= 200, ] %>%
+  .[, (names(dep_regs)[-(1:2)]) := lapply(.SD, function(x){x/sd(x, na.rm = T)}), .SDcols = names(dep_regs)[-(1:2)]] 
+  
+dep_res <- lapply(dep_vars, function(x) {
+  return(list(lm(paste("ige ~", x), dep_regs),
+              lm(paste("rrc ~", x), dep_regs),
+              lm(paste("aum ~", x), dep_regs)))
+})
+```
+
+```{r tabD2D3D4}
+# IGE
+tabD2 <- lapply(1:14, function(x){dep_res[[x]][[1]]}) %>%
+  stargazer(type = "latex", keep.stat = c("N", "rsq"))
+writeLines(tabD2, paste0(prj_dir, "out/tab/tabD2_separate_regs_ige.tex"))
+
+# RRc
+tabD3 <- lapply(1:14, function(x){dep_res[[x]][[2]]}) %>%
+  stargazer(type = "latex", keep.stat = c("N", "rsq"))
+writeLines(tabD3, paste0(prj_dir, "out/tab/tabD3_separate_regs_rrc.tex"))
+
+# AUM
+tabD4 <- lapply(1:14, function(x){dep_res[[x]][[3]]}) %>%
+  stargazer(type = "latex", keep.stat = c("N", "rsq"))
+writeLines(tabD4, paste0(prj_dir, "out/tab/tabD4_separate_regs_aum.tex"))
+```
+
+```{r}
+measures <- c("ige", "rrc", "aum")
+
+figD1 <- lapply(1:3, function(i){
+  lapply(1:14, function(x){
+    
+    s <- summary(dep_res[[x]][[i]])
+    return(data.table(coef = s$coefficients[2, 1],
+                      se = s$coefficients[2, 2]))
+    
+  }) %>% rbindlist() %>% 
+    .[, ":=" (var = dep_vars, measure = measures[i])] %>% return()
+  
+}) %>% rbindlist() %>%
+  mutate(lb = coef - qt(.975, length(dep_regs) - 2)* se,
+         ub = coef + qt(.975, length(dep_regs) - 2)* se,
+         n = 85) %>%
+  select(n, measure, var, coef, lb, ub) 
+fwrite(figD1,  paste0(prj_dir, "out/fig/figD1_separate_regressions.csv"))
+
+ggplot(figD1, aes(x = var, y = coef, ymin = lb, ymax = ub)) +
+  geom_point() + geom_errorbar()  + facet_wrap(~measure) +
+  geom_hline(yintercept = 0, linetype = "dashed") + coord_flip()
+ggsave(paste0(prj_dir, "out/fig/figD1_separate_regressions.png"))
+```
+
+### Joint regressions
+
+```{r figD4}
+figD4 <- dep_shp %>% 
+  select(dep, geometry) %>%
+  right_join(dep_chars %>% 
+               select(dep, gini_dep, density_dep, amenities_dep, unemp_dep, highschool_dep))
+fwrite(st_drop_geometry(figD4),  paste0(prj_dir, "out/fig/figD4_dep_cov_maps.csv"))
+
+ggplot(figD4, aes(fill = gini_dep)) + geom_sf()
+ggplot(figD4, aes(fill = density_dep)) + geom_sf()
+ggplot(figD4, aes(fill = amenities_dep)) + geom_sf()
+ggplot(figD4, aes(fill = unemp_dep)) + geom_sf()
+ggplot(figD4, aes(fill = highschool_dep)) + geom_sf()
+```
+
+```{r tabF11}
+tabF11 <- list(lm(ige ~ density_dep + unemp_dep + gini_dep + highschool_dep + amenities_dep, dep_regs),
+               lm(rrc ~ density_dep + unemp_dep + gini_dep + highschool_dep + amenities_dep, dep_regs),
+               lm(aum ~ density_dep + unemp_dep + gini_dep + highschool_dep + amenities_dep, dep_regs)) %>%
+  stargazer(type = "latex", keep.stat = c("N", "rsq"))
+
+writeLines(tabF11, paste0(prj_dir, "out/tab/tabF11_joint_regressions.tex"))
+```
+
+### Lasso
+
+```{r figD3}
+figD3 <- lapply(c("ige", "rrc", "aum"), function(x) {
+  
+  model <- model.matrix(eval(parse(text = paste(x, "~ ."))), 
+                        dep_regs %>% select(x, dep_vars))[, -1]
+  
+  lasso <- cv.glmnet(x = model, y = dep_regs[[x]], alpha = 1)
+  
+  id_kept <- coef(lasso, s = lasso$lambda.min)@i
+
+  return(data.table(var = dep_vars, measure = x) %>%
+           .[, kept := as.numeric(var %in% dep_vars[id_kept])])
+  
+}) %>% rbindlist()
+fwrite(figD3,  paste0(prj_dir, "out/fig/figD3_lasso.csv"))
+
+ggplot(figD3, aes(x = measure, y = var, fill = as.factor(kept))) + geom_tile()
+ggsave(paste0(prj_dir, "out/fig/figD3_lasso.png"))
+```
+
+## Geographic mobility
+
+```{r}
+setDT(children)
+children[, mobility := as.numeric(dep != adult_dep)] 
+
+in_text_figures <- in_text_figures %>%
+  rbind(children %>%
+        .[!is.na(mobility) & !is.na(family_income_n_spatial_household_income_rank), 
+          .(Label = "%movers all", Figure = mean(mobility), N = .N)],
+      children %>%
+        .[!is.na(mobility) & !is.na(family_income_n_spatial_household_income_rank), 
+          .(Figure = mean(mobility), N = .N), by = gender] %>%
+        .[, .(Label = paste("% movers", gender), Figure, N)])
+```
+
+### Mobility CEF
+
+```{r figE14}
+figE14 <- children %>%
+  .[!is.na(family_income_n_spatial_household_income_rank)] %>%
+  .[, .(n = .N, pct_movers = mean(mobility, na.rm = T)), 
+    by = family_income_n_spatial_household_income_rank]  %>%
+  .[order(n), .(n, family_income_n_spatial_household_income_rank, pct_movers)]
+fwrite(figE14,  paste0(prj_dir, "out/fig/figE14_mobility_cef.csv"))
+
+ggplot(figE14, aes(x = family_income_n_spatial_household_income_rank, y = pct_movers)) + 
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = F) +
+  scale_y_continuous(limits = c(0, .8))
+ggsave(paste0(prj_dir, "out/fig/figE14_mobility_cef.png"))
+```
+
+### National ranks
+
+```{r fig8}
+children %>%
+  .[!is.na(mobility) & !is.na(family_income_n_spatial_household_income_rank), .N, by = mobility] %>%
+  .[, pct := N/sum(N)] %>% .[]
+
+fig8 <- children %>%
+  .[!is.na(family_income_n_spatial_household_income_rank)] %>%
+  .[, .(n = .N, child_rank = mean(household_income_family_income_n_spatial_rank, na.rm = T)), 
+    by = c("family_income_n_spatial_household_income_rank", "mobility")] %>%
+  .[order(n), .(n, family_income_n_spatial_household_income_rank, mobility, child_rank)]
+fwrite(fig8, paste0(prj_dir,  "out/fig/fig8_mobility_nat_rank.csv"))
+
+ggplot(fig8, aes(x = family_income_n_spatial_household_income_rank, y = child_rank, 
+             color = mobility, group = mobility)) + 
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x,3), se = F)
+ggsave(paste0(prj_dir, "out/fig/fig8_mobility_nat_rank.png"))
+```
+
+```{r tab3}
+children[, ":=" (father_cs_nm = as.factor(ifelse(is.na(father_cs2_90), 0, father_cs2_90)),
+                mother_cs_nm = as.factor(ifelse(is.na(mother_cs2_90), 0, mother_cs2_90)),
+                father_edu_nm = as.factor(ifelse(is.na(father_edu_90), 0, father_edu_90)),
+                mother_edu_nm = as.factor(ifelse(is.na(mother_edu_90), 0, mother_edu_90)))]
+
+tab3 <- list(lm(household_income_family_income_n_spatial_rank ~ 
+                  family_income_n_spatial_household_income_rank*mobility + 
+                  factor(birth_year), children), 
+             lm(household_income_family_income_n_spatial_rank ~ 
+                  family_income_n_spatial_household_income_rank*mobility + 
+                  factor(birth_year) + factor(gender), children), 
+             lm(household_income_family_income_n_spatial_rank ~ 
+                  family_income_n_spatial_household_income_rank*mobility + 
+                  factor(birth_year) + factor(gender) + factor(dep), children), 
+             lm(household_income_family_income_n_spatial_rank ~ 
+                  family_income_n_spatial_household_income_rank*mobility + 
+                  factor(birth_year) + factor(gender) + factor(dep) + 
+                  factor(mother_edu_nm) + factor(father_edu_nm), children), 
+             lm(household_income_family_income_n_spatial_rank ~ 
+                  family_income_n_spatial_household_income_rank*mobility + 
+                  factor(birth_year) + factor(gender) + factor(dep) + 
+                  factor(mother_edu_nm) + factor(father_edu_nm) +
+                  factor(mother_cs_nm) + factor(father_cs_nm), children)) %>%
+  stargazer(type = "latex", keep.stat = c("N", "rsq"))
+
+writeLines(tab3, paste0(prj_dir, "out/tab/tab3_mobility_nat_rank.tex"))
+```
+
+### Local ranks
+
+```{r figE15}
+# Rank within department
+children <- children %>%
+  .[, missing := constant_sample == F | is.na(household_income) | is.na(family_income_n_spatial) | 
+      missing_parent_spatial == 1 | constant_sample == F] %>%
+  .[, rank_child_income := ifelse(household_income < 0, 0, household_income)] %>%
+  # Rank child
+  .[order(missing, adult_dep, birth_year, household_income, ID_DIFF), ] %>% 
+  # Compute percentile
+  .[, child_dep_rank := ceiling(100 * (1:.N / .N)), by = c("missing", "adult_dep", "birth_year")] %>%
+  # Give the median rank to individuals with same income but different ranks
+  .[, child_dep_rank := ceiling(median(child_dep_rank)), 
+    by = c("missing", "adult_dep", "birth_year", "rank_child_income")] %>%
+  # Replace rank by missing if income missing
+  .[, child_dep_rank := ifelse(missing, NA, child_dep_rank)] %>%
+  # Rank parents
+  .[order(missing, dep, birth_year, family_income_n_spatial, ID_DIFF), ] %>%
+  # Compute percentile
+  .[, family_dep_rank := ceiling(100 * (1:.N / .N)), by = c("missing", "dep", "birth_year")] %>%
+  # Give the median rank to individuals with same income but different ranks
+  .[, family_dep_rank := ceiling(median(family_dep_rank)), 
+    by = c("missing", "dep", "birth_year", "family_income_n_spatial")] %>%
+  # Replace rank by missing if income missing
+  .[, family_dep_rank := ifelse(missing, NA, family_dep_rank)] %>%
+  # Remove temporary variables
+  .[, ":=" (missing = NULL, rank_child_income = NULL)]
+
+figE15 <- children %>%
+  .[!is.na(family_dep_rank)] %>%
+  .[, .(n = .N, child_dep_rank = mean(child_dep_rank, na.rm = T)), by = c("family_dep_rank", "mobility")] %>%
+  .[order(n), .(family_dep_rank, mobility, child_dep_rank)]
+fwrite(figE15,  paste0(prj_dir, "out/fig/figE15_mobility_dep_rank.csv"))
+
+ggplot(figE15, aes(x = family_dep_rank, y = child_dep_rank, 
+             color = mobility, group = mobility)) + 
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x,3), se = F) +
+  scale_y_continuous(limits = c(20, 80))
+ggsave(paste0(prj_dir, "out/fig/figE15_mobility_dep_rank.png"))
+```
+
+```{r tabF12}
+tabF12 <- list(lm(child_dep_rank ~ 
+                    family_dep_rank*mobility + 
+                    factor(birth_year), children), 
+               lm(child_dep_rank ~ 
+                    family_dep_rank*mobility + 
+                    factor(birth_year) + factor(gender), children), 
+               lm(child_dep_rank ~ 
+                    family_dep_rank*mobility + 
+                    factor(birth_year) + factor(gender) + factor(dep), children), 
+               lm(child_dep_rank ~ 
+                    family_dep_rank*mobility + 
+                    factor(birth_year) + factor(gender) + factor(dep) + 
+                    factor(mother_edu_nm) + factor(father_edu_nm), children), 
+               lm(child_dep_rank ~ 
+                    family_dep_rank*mobility + 
+                    factor(birth_year) + factor(gender) + factor(dep) + 
+                    factor(mother_edu_nm) + factor(father_edu_nm) +
+                    factor(mother_cs_nm) + factor(father_cs_nm), children)) %>%
+  stargazer(type = "latex", keep.stat = c("N", "rsq"))
+
+writeLines(tabF12, paste0(prj_dir, "out/tab/tabF12_mobility_dep_rank.tex"))
+```
+
+### Origin/destination mean rank
+
+```{r fig9}
+fig9 <- copy(children) %>%
+  .[, origin_dep_rank := mean(family_income_n_spatial_household_income_rank, na.rm = T), by = "dep"] %>%
+  .[, destin_dep_rank := mean(household_income_family_income_n_spatial_rank, na.rm = T), by = "adult_dep"] %>%
+  .[mobility == 1 & !is.na(family_income_n_spatial_household_income_rank)] %>%
+  .[, family_ventile := ceiling(20*family_income_n_spatial_household_income_rank/100)] %>%
+  .[, ntot := .N] %>%
+  .[, .(origin_dep_rank = mean(origin_dep_rank),
+        destin_dep_rank = mean(destin_dep_rank),
+        share = .N/unique(ntot),
+        n = .N), by = family_ventile] %>% 
+  melt(id.vars = c("family_ventile", "share", "n"), measure.vars = c("origin_dep_rank", "destin_dep_rank")) %>%
+  .[order(n), .(n, family_ventile, share, variable, value)]
+fwrite(fig9,  paste0(prj_dir, "out/fig/fig9_origin_destin_mean_rank.csv"))
+
+ggplot(fig9, aes(x = family_ventile, y = value, color = variable, group = variable, size = share)) + 
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = F)
+ggsave(paste0(prj_dir, "out/fig/fig9_origin_destin_mean_rank.png"))
+```
+
+```{r}
+# Response to referees
+alluvial_plot <- copy(children) %>%
+  .[, origin_dep_rank := mean(family_income_n_spatial_household_income_rank, na.rm = T), by = "dep"] %>%
+  .[, destin_dep_rank := mean(household_income_family_income_n_spatial_rank, na.rm = T), by = "adult_dep"] %>%
+  .[mobility == 1 &  !is.na(family_income_n_spatial_household_income_rank)] %>%
+  .[, .(n = .N, origin_dep_rank = unique(origin_dep_rank), destin_dep_rank = unique(destin_dep_rank)), 
+    by = c("dep", "adult_dep")] %>% 
+  .[n/sum(n) > .002] %>%
+  left_join(dep_shp %>% st_drop_geometry() %>%
+              rename(dep_lab_origin = dep_lab)) %>% 
+  left_join(dep_shp %>% st_drop_geometry() %>%
+              rename(dep_lab_destin = dep_lab, adult_dep = dep)) %>%
+  mutate(dep_lab_destin = paste0(" ", dep_lab_destin)) %>%
+  select(n, dep, adult_dep, origin_dep_rank, destin_dep_rank, dep_lab_origin, dep_lab_destin) %>%
+  arrange(n)
+fwrite(alluvial_plot,  paste0(prj_dir, "out/fig/alluvial_plot.csv"))
+
+ggplot(alluvial_plot, aes(y = n, axis1 = reorder(dep_lab_origin, -origin_dep_rank), 
+             axis2 = reorder(dep_lab_destin, -destin_dep_rank))) +
+  geom_alluvium(aes(fill=destin_dep_rank)) + geom_stratum() + 
+  geom_text(stat = "stratum", aes(label = after_stat(stratum))) +
+  scale_fill_viridis_c()
+ggsave(paste0(prj_dir, "out/fig/alluvial_plot.png"))
+```
+
+```{r}
+idf <- c(75, 77:78, 91:95)
+
+idf_mobility <- copy(children) %>% 
+  .[!is.na(mobility)] %>%
+  .[, idf_mobility := fcase(mobility == 0 & dep %in% idf, 
+                            "Stayers within Paris reg.",
+                            mobility == 0 & !dep %in% idf, 
+                            "Stayers outside Paris reg.",
+                            mobility == 1 & dep %in% idf & adult_dep %in% idf, 
+                            "Movers within Paris reg.",
+                            mobility == 1 & dep %in% idf & !adult_dep %in% idf, 
+                            "Movers from Paris reg.",
+                            mobility == 1 & adult_dep %in% idf & !dep %in% idf, 
+                            "Movers to Paris reg.",
+                            mobility == 1 & (!adult_dep %in% idf | dep %in% idf), 
+                            "Movers outside Paris reg.")]
+
+idf_rrc <- lm(household_income_family_income_n_spatial_rank ~ family_income_n_spatial_household_income_rank*idf_mobility, 
+   idf_mobility %>% mutate(idf_mobility = relevel(as.factor(idf_mobility), "Stayers outside Paris reg.")))
+
+idf_rrc %>%
+  stargazer(type = "latex", keep.stat = c("N", "rsq")) %>%
+  writeLines(paste0(prj_dir, "out/tab/idf_mobility_regression.tex"))
+
+# RRC
+idf_igm <- as.data.frame(summary(idf_rrc)$coefficients) %>%
+  rownames_to_column() %>% 
+  mutate(measure = ifelse(grepl("family_income_n_spatial_household_income_rank", rowname), "rrc", "aum"),
+         rowname = gsub("family_income_n_spatial_household_income_rank|:|idf_mobility", "", rowname),
+         rowname = ifelse(rowname %in% c("", "(Intercept)"), "Stayers outside Paris reg.", rowname)) %>%
+  select(idf_mobility = rowname, measure, coef = Estimate, se = `Std. Error`) %>%
+  pivot_wider(id_cols = idf_mobility, values_from = c(coef, se), names_from = measure) %>%
+  mutate(coef_rrc = ifelse(idf_mobility != "Stayers outside Paris reg.", coef_rrc + coef_rrc[1], coef_rrc),
+         coef_aum = ifelse(idf_mobility != "Stayers outside Paris reg.", coef_aum + coef_aum[1], coef_aum),
+         coef_aum = coef_aum + 25*coef_rrc) %>%
+  pivot_longer(-idf_mobility) %>%
+  separate(name, c("type", "igm"), "_") %>%
+  pivot_wider(names_from = "type", values_from = "value") %>%
+  mutate(lb = coef - qt(.975, summary(idf_rrc)$df[2])*se,
+         ub = coef + qt(.975, summary(idf_rrc)$df[2])*se,
+         variable = NA, N = NA, pct = NA) %>%
+  rename(value = coef) %>%
+  rbind(idf_mobility %>%
+          .[, .(parents_rank = mean(family_income_n_spatial_household_income_rank, na.rm = T), 
+                child_rank = mean(household_income_family_income_n_spatial_rank, na.rm = T),
+                .N), by = idf_mobility]%>%
+          melt(id.vars = c("idf_mobility", "N"), measure.vars = c("parents_rank", "child_rank")) %>%
+          .[, ":=" (igm = "rank", se = NA, lb = NA, ub = NA,
+                    pct = round(200*N/sum(N)))]) %>% 
+  group_by(idf_mobility) %>%
+  mutate(pct = max(pct, na.rm = T),
+         N = max(N, na.rm = T)) %>% 
+  ungroup() %>%
+  mutate(order_facet = case_when(igm == "rank" ~ 1,
+                                 igm == "rrc" ~ 2,
+                                 igm == "aum" ~ 3),
+         order_x = case_when(idf_mobility == "Stayers outside Paris reg." ~ 1,
+                                 idf_mobility == "Stayers within Paris reg." ~ 2,
+                                 idf_mobility == "Movers outside Paris reg." ~ 3,
+                                 idf_mobility == "Movers from Paris reg." ~ 4,
+                                 idf_mobility == "Movers to Paris reg." ~ 5,
+                                 idf_mobility == "Movers within Paris reg." ~ 6),
+         idf_mobility = paste0(idf_mobility, " (", pct, "%)"),
+         variable = ifelse(is.na(variable), "IGM", variable)) %>%
+  select(n = N, idf_mobility, igm, order_facet, variable, idf_mobility, order_x, value, lb, ub) %>%
+  arrange(n)
+fwrite(idf_igm,  paste0(prj_dir, "out/fig/idf_igm.csv"))
+
+ggplot(idf_igm, aes(x = reorder(idf_mobility, -order_x), y = value, ymin = lb, ymax = ub, group = idf_mobility)) +
+  geom_point(aes(color = variable, size = variable)) + geom_line() +
+  geom_errorbar(width = .1) + coord_flip() + facet_wrap(~reorder(igm, order_facet),  nrow = 1, scales = "free_x")
+ggsave(paste0(prj_dir, "out/fig/idf_igm.png"))
+
+
+
+idf_cef <- idf_mobility %>%
+  .[!is.na(family_income_n_spatial_household_income_rank)] %>% 
+  .[, family_ventile := ceiling(20 * (family_income_n_spatial_household_income_rank / 100))] %>%
+  .[, .(n = .N, child_rank = mean(household_income_family_income_n_spatial_rank, na.rm = T),
+        household_log_income = mean(household_log_income, na.rm = T),
+        family_log_income = mean(family_log_income_n_spatial, na.rm = T)), 
+    by = c("family_ventile", "idf_mobility")] %>%
+  .[order(n), .(n, family_ventile, idf_mobility, child_rank,household_log_income,family_log_income)]
+fwrite(idf_cef,  paste0(prj_dir, "out/fig/idf_cef.csv"))
+
+ggplot(idf_cef, aes(x = family_ventile, y = child_rank, color = idf_mobility)) +
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x, 1), se = F)
+ggsave(paste0(prj_dir, "out/fig/idf_cef.png"))
+```
+
+### CEF by type of destination
+
+```{r fig10}
+copy(children) %>%
+    .[!is.na(family_income_n_spatial_household_income_rank)] %>%
+    .[, .(mean_dep_rank = mean(household_income_family_income_n_spatial_rank, na.rm = T),
+          n_movers = sum(mobility == 1)), by = "adult_dep"]  %>% .[, pct_movers := 100*n_movers/sum(n_movers)] %>%
+    ggplot(aes(x=mean_dep_rank, y = pct_movers, label = adult_dep)) + 
+    geom_bar(stat = "identity", width = 1, alpha = .8) +
+    geom_vline(xintercept = c(50, 60)) + geom_text()
+ggsave(paste0(prj_dir, "out/fig/share_of_movers_by_destination_department.png"))
+
+mean_dep_rank <- copy(children) %>%
+  .[!is.na(family_income_n_spatial_household_income_rank)] %>%
+  .[, .(mean_dep_rank = mean(household_income_family_income_n_spatial_rank, na.rm = T),
+        n_movers = sum(mobility == 1)), by = "adult_dep"]  %>%
+  .[, dep_type := fcase(mean_dep_rank > 60, "High",
+                        mean_dep_rank <= 60 & mean_dep_rank > 50, "Medium",
+                        mean_dep_rank <= 50, "Low")]
+
+in_text_figures <- in_text_figures %>%
+  rbind(mean_dep_rank %>%
+          .[, .(n_dep = .N, n_movers = sum(n_movers)), by = "dep_type"] %>%
+          .[, share_movers := n_movers/sum(n_movers)] %>%
+          melt(id.vars = c("dep_type", "n_movers")) %>%
+          .[, .(Label = paste("dep rank", dep_type, variable), Figure = value, 
+                N = ifelse(variable == "n_dep", 85, n_movers))])
+
+fwrite(in_text_figures, paste0(prj_dir, "out/tab/in_text_figures.csv"))
+
+
+fig10 <- copy(children) %>%
+  merge.data.table(mean_dep_rank) %>%
+  .[mobility  == 0, dep_type := "Stayers"] %>%
+  .[!is.na(family_income_n_spatial_household_income_rank)] %>%
+  .[, family_ventile := ceiling(20*family_income_n_spatial_household_income_rank/100)] %>%
+  .[, N := .N] %>%
+  .[, .(n = .N, child_rank = mean(household_income_family_income_n_spatial_rank, na.rm = T),
+        share = .N/unique(N)), 
+    by = c("family_ventile", "dep_type")] %>%
+  .[order(n), .(n, family_ventile, dep_type, child_rank, share)]
+fwrite(fig10,  paste0(prj_dir, "out/fig/fig10_cef_destination.csv"))
+
+ggplot(fig10, aes(x = family_ventile, y = child_rank, color = dep_type, group = dep_type, size = share)) +
+  geom_point() + geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = F)
+ggsave(paste0(prj_dir, "out/fig/fig10_cef_destination.png"))
+```
+
+```{r tabF13}
+tabF13 <- list(lm(household_income_family_income_n_spatial_rank ~ 
+                    family_income_n_spatial_household_income_rank*dep_type + 
+                    factor(birth_year), children %>%
+                    merge.data.table(mean_dep_rank) %>%
+                    .[mobility  == 0, dep_type := "Stayers"] %>%
+                    .[, dep_type := relevel(factor(dep_type), "Stayers")]), 
+               lm(household_income_family_income_n_spatial_rank ~ 
+                    family_income_n_spatial_household_income_rank*dep_type + 
+                    factor(birth_year) + factor(gender), children %>%
+                    merge.data.table(mean_dep_rank) %>%
+                    .[mobility  == 0, dep_type := "Stayers"] %>%
+                    .[, dep_type := relevel(factor(dep_type), "Stayers")]), 
+               lm(household_income_family_income_n_spatial_rank ~ 
+                    family_income_n_spatial_household_income_rank*dep_type + 
+                    factor(birth_year) + factor(gender) + factor(dep), children %>%
+                    merge.data.table(mean_dep_rank) %>%
+                    .[mobility  == 0, dep_type := "Stayers"] %>%
+                    .[, dep_type := relevel(factor(dep_type), "Stayers")]), 
+               lm(household_income_family_income_n_spatial_rank ~ 
+                    family_income_n_spatial_household_income_rank*dep_type + 
+                    factor(birth_year) + factor(gender) + factor(dep) + 
+                    factor(mother_edu_nm) + factor(father_edu_nm), children %>%
+                    merge.data.table(mean_dep_rank) %>%
+                    .[mobility  == 0, dep_type := "Stayers"] %>%
+                    .[, dep_type := relevel(factor(dep_type), "Stayers")]), 
+               lm(household_income_family_income_n_spatial_rank ~ 
+                    family_income_n_spatial_household_income_rank*dep_type + 
+                    factor(birth_year) + factor(gender) + factor(dep) + 
+                    factor(mother_edu_nm) + factor(father_edu_nm) +
+                    factor(mother_cs_nm) + factor(father_cs_nm), children %>%
+                    merge.data.table(mean_dep_rank) %>%
+                    .[mobility  == 0, dep_type := "Stayers"] %>%
+                    .[, dep_type := relevel(factor(dep_type), "Stayers")])) %>%
+  stargazer(type = "latex", keep.stat = c("N", "rsq"))
+
+writeLines(tabF13, paste0(prj_dir, "out/tab/tabF13_destination_type.tex"))
+Sys.time()
+```

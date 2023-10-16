@@ -1,0 +1,2657 @@
+---
+title: "PSID Results"
+author: "Gustave Kenedi and Louis Sirugue"
+date: "`r Sys.time()`"
+format:
+  html:
+    toc: true
+    df-print: paged
+    embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+execute:
+  warning: false
+---
+
+## Packages
+
+```{r}
+packages <- c("here", "tidyverse", "data.table", "readxl", "janitor", "ggthemr", "caret", "patchwork", "tidymodels","ggtext", "scico", "tidylog", "skimr", "kableExtra")
+librarian::shelf(packages, quiet = TRUE, )
+rm(packages)
+```
+
+## Functions
+
+```{r}
+source(here("code_lib", "useful_functions.R"))
+
+source(here("code_lib", "inc_fct.R"))
+source(here("code_lib", "gen_ranks.R"))
+
+source(here("code_lib", "matrix_graph_fct.R"))
+
+source(here("code_lib", "tstsls_fct.R"))
+source(here("code_lib", "caption_fct.R"))
+source(here("code_lib", "indiv_pred_graph.R"))
+source(here("code_lib", "prediction_graph.R"))
+source(here("code_lib", "prediction_rank_graph.R"))
+source(here("code_lib", "prediction_quintile_graph.R"))
+
+source(here("code_lib", "ige_comparison_graph.R"))
+source(here("code_lib", "rrc_comparison_graph.R"))
+source(here("code_lib", "matrix_predicted_graph.R"))
+source(here("code_lib", "aum_comparison_graph.R"))
+```
+
+## Params
+
+```{r}
+# figures
+fig_height = 6
+fig_width = (16/9)*fig_height
+ggthemr("pale")
+
+text_size = 14
+title_size = 13
+
+theme_update(text = element_text(size = text_size),
+             plot.title = element_text(size = title_size, face = "italic"),
+             legend.title = element_text(face = "italic", size = 12),
+             legend.text = element_text(size = 12),
+             legend.background = element_rect(fill = alpha("white", .75)),
+             plot.caption = element_text(size = 10, face = "italic", color = "#7d7d7d"),
+             strip.text = element_text(size = 11, face = "plain"))
+
+alpha = 0.8
+my_palette = scico(5, palette = "lajolla", begin = .2, end = .95)
+
+my.ggsave <- function(filename = default_name(plot), height = fig_height, width = fig_width) {
+  ggsave(filename = filename, height = height, width = width)
+}
+
+# no scientific notation
+options(scipen=999)
+
+# path to data
+data_path <- "~/Dropbox/3resources/data/psid/"
+figure_path <- "/Users/gustave/Dropbox/Apps/Overleaf/Intergenerational Income Mobility/psid_validation/figures/"
+```
+
+## Load data
+
+```{r}
+#| cache: true
+#| output: false
+
+# PSID variables dictionary
+psid_vars <- read_excel(paste0(data_path, "fims/psid.xlsx")) %>%
+  clean_names() %>%
+  mutate(var_id = 1:n()) %>% 
+  pivot_longer(cols = -c(var_id, type, category, text, head_wife, var_count),
+               names_prefix = "y",
+               names_to = "year",
+               values_to = "variable")
+setDT(psid_vars)
+# family interview id
+psid_vars %>% filter(var_id == 8746) %>% count(text)
+fam_id_vars <- psid_vars %>% filter(var_id == 8746) %>% pull(variable)
+
+# family files 1968-2019
+years <- c(1968:1997, seq(1999, 2019, 2))
+for (i in years) {
+  print(i)
+  
+  if (i %in% 1968:1993) {
+    file_path <- paste0(data_path, "fam", i, "/FAM", i)
+  } else {
+    file_path <- paste0(data_path, "fam", i, "er", "/FAM", i, "ER")
+  }
+  
+  assign(paste0("fam_", i), fread(paste0(file_path, ".csv")))
+}
+
+gc()
+```
+
+## Import intermediate datasets
+
+```{r}
+# correspondence table state-region
+state_correspondance <- fread(here("data/state_correspondance.csv"))
+
+# parents datasets
+parents_sample_clean <- fread(here("data/parents_sample_clean_results.csv"))
+parents_sample_clean <- parents_sample_clean %>% 
+  mutate(across(where(is.character), ~ ifelse(. == "", NA, .)))
+parents_sample_long <- fread(here("data/parents_sample_long.csv"))
+
+# children datasets
+child_sample_clean <- fread(here("data/child_sample_clean_results.csv"))
+child_sample_clean <- child_sample_clean %>%
+  left_join(state_correspondance, by = c("state" = "state_code"))
+child_sample_long <- fread(here("data/child_sample_long.csv"))
+
+# link parent-child
+child_first_parents <- fread(here("data", "child_first_parents.csv")) %>% 
+  rename(ind_id_68_child = child_fam) %>% 
+  select(ind_id_68, ind_id_68_child, rel_to_head, gender)
+
+# income data
+inc_all <- fread(here("data/inc_all.csv"))
+
+# regions
+regions = child_sample_clean %>% distinct(region) %>% filter(!is.na(.)) %>% pull()
+```
+
+# Benchmark results
+
+Note that: "In the PSID, the household head is recorded as having zero labor income if their income was actually zero or if their labor income is missing, so one cannot cleanly distinguish true zeroes with labor income. All of the main analysis only uses years of non-zero income when constructing time averages of income." ([Mazumder, 2016, p. 101](zotero://select/library/items/IGV8QXK7)) ([pdf](zotero://open-pdf/library/items/CIE4Y835?page=19&annotation=RE8H2T4M))
+
+The `inc_fct()` function has a `zero_to_na` parameter which if set to `T` replaces 0 incomes by missing. Since the documentation isn't so clear about what zeros actually correspond, in the baseline results, zeros are not replaced, but as a robustness we drop zero income observations.
+
+## Parameters
+
+```{r}
+# income definitions
+inc_vars = c("labor income", "family labor income", "family tax income", "family total income")
+
+# minimum and maximum child/parent age at income observation
+child_age_min = 30
+child_age_max = 50
+parent_age_min = 30
+parent_age_max = 50
+
+# restriction for number of parent/child income observations
+n_parent_inc = 1
+n_child_inc = 1
+
+# replace zero incomes
+replace_zero_incomes = F
+```
+
+## Income variable creation
+
+```{r}
+child_sample_clean %>% names
+
+# drop income variables from child and parent data.frames
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+parents_sample_clean <- parents_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+
+# obtain children income variables
+child_sample_clean <- child_sample_clean %>%
+  left_join(inc_vars %>% 
+              map(~ inc_fct(dt = child_sample_long,
+                            inc_var = .x,
+                            age_range = child_age_min:child_age_max,
+                            zero_to_na = replace_zero_incomes) %>% 
+                    select(-contains("age"))) %>% 
+              reduce(full_join, by = "ind_id_68"))
+child_sample_clean %>% names
+
+# obtain parent income variables
+parents_sample_clean <- parents_sample_clean %>% 
+  left_join(inc_vars %>% 
+              map(~ inc_fct(dt = parents_sample_long,
+                            inc_var = .x,
+                            age_range = parent_age_min:parent_age_max,
+                            zero_to_na = replace_zero_incomes) %>% 
+                    select(-contains("age"))) %>%
+              reduce(full_join, by = "ind_id_68"))
+parents_sample_clean %>% names
+
+# obtain children's id
+parents_sample_clean_withchildren <- parents_sample_clean %>% 
+  left_join(child_first_parents %>% select(ind_id_68, ind_id_68_child))
+
+# for each child, get one parent income measure
+# each parent income measure has 2 definitions: one accounts for family size (i.e, number of head and "wife"), the other doesn't
+# this is because not accounting for the number of "parents" could unreasonably affect single-headed households
+child_sample_clean <- child_sample_clean %>% 
+  left_join(parents_sample_clean_withchildren %>%
+              mutate(across(starts_with("n_") & !contains("_n_"), ~ ifelse(gender == "Female", .x, NA), .names = "n_mother_{.col}"),
+                     across(starts_with("n_") & !contains("_n_"), ~ ifelse(gender == "Male", .x, NA), .names = "n_father_{.col}")) |>
+              group_by(ind_id_68_child) %>%
+              summarise(presence_father = sum(gender == "Male"),
+                        n_parents = n_distinct(ind_id_68),
+                        across(starts_with("mean") & contains("income"), ~ mean(.x), .names = "parent_mean_{.col}"),
+                        across(mean_labor_income_real_3050, ~ sum(.x), .names = "parent_sum_{.col}"),
+                        across(contains(c("father", "mother")), ~ ifelse(!is.na(mean(.x, na.rm = T)), mean(.x, na.rm = T), 0))) %>% 
+              rename(ind_id_68 = ind_id_68_child))
+
+# child income variables
+child_inc_vars <- child_sample_clean %>% 
+  select(contains("income") & !starts_with(c("n_", "parent_"))) %>% 
+  names()
+child_inc_vars_labs <- paste0(c("Individual labor income\n",
+                                "Family labor income",
+                                "Family labor income\n(div. number of adults)",
+                                "Family taxable income",
+                                "Family taxable income\n(div. number of adults)",
+                                "Family total income",
+                                "Family total income\n(div. number of adults)"),
+                              " (", child_age_min, "-", child_age_max, ")")
+
+# parent income variables
+parent_inc_vars <- child_sample_clean %>% 
+  select(contains("income") & !starts_with("n_") & starts_with("parent")) %>% 
+  names()
+# parent_inc_vars <- parent_inc_vars[-1] # drop individual 
+parent_inc_vars_labs <- paste0(c("Individual labor income (mean)",
+                                 "Family labor income",
+                                 "Family labor income\n(div. number of adults)",
+                                 "Family taxable income",
+                                 "Family taxable income\n(div. number of adults)",
+                                 "Family total income",
+                                 "Family total income\n(div. number of adults)",
+                                 "Individual labor income (sum)"),
+                               " (", parent_age_min, "-", parent_age_max, ")")
+
+# child and parent income vectors
+child_inc_vars_all <- crossing(child_inc_vars, parent_inc_vars)$child_inc_vars
+parent_inc_vars_all <- crossing(child_inc_vars, parent_inc_vars)$parent_inc_vars
+
+# define core sample as the sample of children for whom baseline household-level child and parent income variables are observed
+child_sample_clean <- child_sample_clean %>%
+  mutate(core_sample = ifelse(!is.na(mean_family_total_income_real_3050) & !is.na(parent_mean_mean_family_total_income_real_3050), T, F))
+child_sample_clean |> count(core_sample)
+
+# identify children whose parents have more than n_parent_inc income observations
+child_sample_clean <- child_sample_clean |> 
+  mutate(more_than_n_parent_inc =
+           ((n_parents == 1 & presence_father == T &  n_father_n_family_total_income_real_3050 >= n_parent_inc) |
+              (n_parents == 1 & presence_father == F & n_mother_n_family_total_income_real_3050 >= n_parent_inc) |
+              (n_parents == 2 & n_father_n_family_total_income_real_3050 >= n_parent_inc & n_mother_n_family_total_income_real_3050 >= n_parent_inc)))
+child_sample_clean |> count(more_than_n_parent_inc)
+
+# dummy denoting children with more than n_child_inc income observations
+child_sample_clean <- child_sample_clean |> 
+  mutate(more_than_child_inc = (!is.na(n_family_total_income_real_3050) & n_family_total_income_real_3050 >= n_child_inc))
+child_sample_clean |> count(more_than_child_inc == T)
+
+# rank all child and parent income variables only for subset of children with all child income variables and all parent income variables
+child_sample_clean <- child_sample_clean %>% 
+  left_join(c(child_inc_vars, parent_inc_vars) |> 
+              map(~ gen_ranks(dt = child_sample_clean |>
+                                filter(core_sample == T & more_than_n_parent_inc == T & more_than_child_inc == T),
+                              inc = .x)) %>%
+              reduce(left_join, by ="ind_id_68"))
+child_sample_clean %>% names()
+
+# obtain log incomes and replace <=0s values by NA
+child_sample_clean <- child_sample_clean |> 
+  mutate(across(contains(c("mean", "sum")) & contains("income") & !contains("rank"), ~ ifelse(.x <= 0, NA, log(.x)), .names = "log_{.col}"))
+
+# baseline core sample
+dt_reg <- child_sample_clean |> filter(core_sample == T)
+```
+
+## IGE - ALL
+
+```{r}
+# estimate log-log relationship (including birth year FEs)
+ige_coefs <- map2_dfr(.x = child_inc_vars_all, .y = parent_inc_vars_all,
+                      ~ tidy(lm(formula(paste0("log_", .x, " ~ log_", .y, " + factor(birth_year)")), data = dt_reg)) %>% 
+                        filter(grepl("log", term)) %>% 
+                        mutate(child_inc_var = .x,
+                               child_inc_var_lab = child_inc_vars_labs[which(child_inc_vars == .x)],
+                               parent_inc_var_lab = parent_inc_vars_labs[which(parent_inc_vars == .y)],
+                               num_obs = nobs(lm(formula(paste0("log_", .x, " ~ log_", .y, " + factor(birth_year)")), data = dt_reg))) %>% 
+                        select(child_inc_var, child_inc_var_lab, parent_inc_var = term, parent_inc_var_lab, coef = estimate, se = std.error, num_obs))
+fwrite(ige_coefs, here("data", "figures_raw_data", "ige_coefs.csv"))
+
+# graph of baseline IGEs
+ige_coefs %>%
+  ggplot(aes(x = child_inc_var_lab, y = parent_inc_var_lab, fill = coef, label = paste0(round(coef, 3), "\n(", round(se, 3), ")"))) +
+  geom_tile() +
+  geom_text(color = "white") +
+  labs(x = "Child income definition",
+       y = "Parent income definition",
+       caption = paste0("Naive standard errors in parenthesis. Number of children varies by income defintion since the number of negative or zero incomes varies.")
+  ) +
+  scale_x_discrete(guide = guide_axis(n.dodge = 2), expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  scale_fill_scico(palette = "lajolla", begin = .2, end = .95) +
+  theme(legend.position = "none",
+        panel.grid = element_blank())
+my.ggsave(paste0(figure_path, "benchmark_ige.pdf"))
+```
+
+## RRC - ALL
+
+```{r}
+# estimate rank-rank correlations (including birth year FEs)
+rrc_coefs <- map2_dfr(.x = child_inc_vars_all, .y = parent_inc_vars_all,
+                      ~ tidy(lm(formula(paste0("rank_", .x, "~ rank_", .y, " + factor(birth_year)")), data = dt_reg)) %>% 
+                        filter(grepl("rank", term)) %>% 
+                        mutate(child_inc_var = .x,
+                               child_inc_var_lab = child_inc_vars_labs[which(child_inc_vars == .x)],
+                               parent_inc_var_lab = parent_inc_vars_labs[which(parent_inc_vars == .y)],
+                               num_obs = nobs(lm(formula(paste0("rank_", .x, "~ rank_", .y, " + factor(birth_year)")), data = dt_reg))) %>% 
+                        select(child_inc_var, child_inc_var_lab, parent_inc_var = term, parent_inc_var_lab, coef = estimate, se = std.error, num_obs))
+fwrite(rrc_coefs, here("data", "figures_raw_data", "rrc_coefs.csv"))
+
+# graph of baseline RRCs
+n_obs <- rrc_coefs |> pull(num_obs) |> unique() |> formatC(format = "d", big.mark = ",")
+rrc_coefs %>%
+  ggplot(aes(x = child_inc_var_lab, y = parent_inc_var_lab, fill = coef, label = paste0(round(coef, 3), "\n(", round(se, 3), ")"))) +
+  geom_tile() +
+  geom_text(color = "white") +
+  labs(x = "Child income definition",
+       y = "Parent income definition",
+       caption = paste0("Naive standard errors in parenthesis. Number of children: ", n_obs, ".")) +
+  scale_x_discrete(guide = guide_axis(n.dodge = 2), expand = c(0,0)) +
+  scale_y_discrete(expand = c(0,0)) +
+  scale_fill_scico(palette = "lajolla", begin = .2, end = .95) +
+  theme(legend.position = "none",
+        panel.grid = element_blank())
+my.ggsave(paste0(figure_path, "benchmark_rrc.pdf"))
+```
+
+## Matrix - ALL
+
+```{r}
+# estimate transition matrices
+matrix <- 
+  map2_dfr(.x = child_inc_vars_all, .y = parent_inc_vars_all, 
+           ~ dt_reg |> 
+             select(ind_id_68, all_of(paste0("rank_", c(.x, .y)))) |> 
+             mutate(across(paste0("rank_", c(.x, .y)), ~ case_when(. %in% 1:20 ~ "Bottom 20%",
+                                                                   . %in% 21:40 ~ "Quintile 2",
+                                                                   . %in% 41:60 ~ "Quintile 3",
+                                                                   . %in% 61:80 ~ "Quintile 4",
+                                                                   . %in% 81:100 ~ "Top 20%"),
+                           .names = "{.col}_quintile"),
+                    across(paste0("rank_", c(.x, .y), "_quintile"), ~ factor(., levels = c("Bottom 20%", "Quintile 2", "Quintile 3", "Quintile 4", "Top 20%"))),
+                    child_inc_var = .x,
+                    child_inc_var_lab = child_inc_vars_labs[which(child_inc_vars == .x)],
+                    parent_inc_var = .y,
+                    parent_inc_var_lab = parent_inc_vars_labs[which(parent_inc_vars == .y)]) |> 
+             select(ind_id_68, child_inc_var, child_inc_var_lab, parent_inc_var, parent_inc_var_lab,
+                    child_inc_rank = paste0("rank_", .x), parent_inc_rank = paste0("rank_", .y),
+                    child_inc_quintile = paste0("rank_", .x, "_quintile"), parent_inc_quintile = paste0("rank_", .y, "_quintile")))
+fwrite(matrix, here("data", "figures_raw_data", "matrix_coefs.csv"))
+
+matrix_graph_fct(matrix, facet = T)
+my.ggsave(paste0(figure_path, "benchmark_matrix.pdf"), height = fig_height*3, width = fig_width*2)
+
+matrix_gp <- matrix |> 
+  group_by(child_inc_var, child_inc_var_lab, parent_inc_var, parent_inc_var_lab, parent_inc_quintile, child_inc_quintile) %>% 
+  summarise(n_obs = n()) %>% 
+  group_by(child_inc_var, child_inc_var_lab, parent_inc_var, parent_inc_var_lab, parent_inc_quintile) %>% 
+  mutate(pct = n_obs/sum(n_obs)) %>% 
+  ungroup()
+fwrite(matrix_gp, here("data", "figures_raw_data", "matrix_gp_coefs.csv"))
+```
+
+## RRC - Baseline CEF
+
+```{r}
+# estimates of rank-rank correlations (including birth year FEs)
+rrc_coefs <- fread(here("data", "figures_raw_data", "rrc_coefs.csv"))
+rrc_coefs <- rrc_coefs |> 
+  filter(child_inc_var_lab == "Family total income (30-50)" & parent_inc_var_lab == "Family total income (30-50)")
+
+# graph of baseline RRC CEF
+n_obs <- rrc_coefs |> pull(num_obs) |> unique() |> formatC(format = "d", big.mark = ",")
+
+rrc_cef_baseline <- child_sample_clean |>
+  filter(core_sample == T) %>% 
+  select(rank_child = rank_mean_family_total_income_real_3050,
+         rank_parent = rank_parent_mean_mean_family_total_income_real_3050) |> 
+  group_by(rank_parent) %>% 
+  summarise(mean_rank_child = mean(rank_child)) %>% 
+  ggplot(aes(x = rank_parent, y = mean_rank_child)) +
+  geom_point(alpha = .8) +
+  geom_text(data = rrc_coefs, aes(x = 1, y = 90, label = paste0("RRC: ", round(coef, 3), " (", round(se, 3), ")")), hjust = 0, size = 5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(lim = c(0,100), expand = c(0, 0)) +
+  scale_x_continuous(lim = c(0,100), expand = c(0.01, 0.01)) +
+  labs(x = "Parent income rank",
+       y = "Mean child income rank",
+       title = "Benchmark Rank-Rank Correlation",
+       # subtitle = "Parent income: family total pretax income 30-50 | Child income: family total pretax income 30-50",
+       # caption = paste0("Naive standard errors in parenthesis. Number of children: ", n_obs)
+  ) +
+  theme(legend.position = "none")
+rrc_cef_baseline
+my.ggsave(paste0(figure_path, "benchmark_rrc_family.pdf"))
+```
+
+## Matrix - Baseline
+
+```{r}
+# estimate transition matrices
+matrix <- fread(here("data", "figures_raw_data", "matrix_coefs.csv"))
+matrix <- matrix |> 
+  filter(child_inc_var_lab == "Family total income (30-50)" & parent_inc_var_lab == "Family total income (30-50)")
+
+matrix_baseline <- matrix_graph_fct(matrix) +
+  scale_x_discrete(expand = c(0,0)) +
+  labs(title = "Benchmark Transition Matrix") +
+  theme(legend.position = "right",
+        panel.grid.major = element_blank(),
+        legend.key = element_rect(linewidth = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(2, "cm"),
+        legend.key.width = unit(1, "cm"))
+matrix_baseline
+my.ggsave(paste0(figure_path, "benchmark_matrix_family.pdf"), height = fig_height*2, width = fig_width*1.75)
+```
+
+## RRC + Matrix - Baseline
+
+```{r}
+patchwork <- rrc_cef_baseline + matrix_baseline + plot_annotation(caption = paste0("Naive standard errors in parenthesis. Number of children: ", n_obs, "\nParent income: family total pretax income (avg. 30-50 yrs old) | Child income: family total pretax income (avg. 30-50 yrs old)"))
+patchwork +
+  plot_annotation(tag_levels = "A")
+my.ggsave(paste0(figure_path, "benchmark_estimates.pdf"))
+```
+
+## RRC and AUM by Region
+
+```{r}
+# baseline child and parent income definitions
+child_inc_reg = "mean_family_total_income_real_3050"
+parent_inc_reg = "parent_mean_mean_family_total_income_real_3050"
+
+# estimate rank-rank correlations (including birth year FEs)
+rrc_coefs <- pmap_dfr(list(x = rep(child_inc_reg, length(regions)), 
+                           y = rep(parent_inc_reg, length(regions)),
+                           z = regions),
+                      ~ tidy(lm(formula(paste0("rank_", ..1, "~ rank_", ..2, " + factor(birth_year)")), data = dt_reg |> filter(region == ..3))) %>%
+                        filter(grepl("rank|(Intercept)", term)) |> 
+                        mutate(region = ..3,
+                               child_inc_var = ..1,
+                               child_inc_var_lab = child_inc_vars_labs[which(child_inc_vars == ..1)],
+                               parent_inc_var_lab = parent_inc_vars_labs[which(parent_inc_vars == ..2)],
+                               num_obs = nobs(lm(formula(paste0("rank_", ..1, "~ rank_", ..2, " + factor(birth_year)")), data = dt_reg |> filter(region == ..3)))) %>% 
+                        select(region, child_inc_var, child_inc_var_lab, parent_inc_var = term, parent_inc_var_lab, coef = estimate, se = std.error, num_obs))
+fwrite(rrc_coefs, here("data/figures_raw_data/rrc_coefs_region.csv"))
+
+# compute AUM
+rrc_coefs <- rrc_coefs |> 
+  group_by(region) |> 
+  mutate(aum = coef[parent_inc_var == "(Intercept)"] + 25 * coef[parent_inc_var == paste0("rank_", parent_inc_reg)]) |> 
+  filter(parent_inc_var != "(Intercept)")
+
+# number of observations clean
+rrc_coefs <- rrc_coefs |>
+  mutate(num_obs =  formatC(num_obs, format = "d", big.mark = ","))
+
+# graph CEF
+rrc_cef_baseline <- dt_reg %>% 
+  filter(!is.na(region)) |>
+  select(region,
+         rank_child = paste0("rank_", child_inc_reg),
+         rank_parent = paste0("rank_", parent_inc_reg)) |> 
+  group_by(region, rank_parent) %>% 
+  summarise(mean_rank_child = mean(rank_child)) %>% 
+  ggplot(aes(x = rank_parent, y = mean_rank_child)) +
+  geom_point(alpha = .8) +
+  geom_text(data = rrc_coefs, aes(x = 1, y = 93, label = paste0("RRC: ", round(coef, 3), " (", round(se, 3), ")")), hjust = 0, size = 5) +
+  geom_text(data = rrc_coefs, aes(x = 1, y = 81, label = paste0("AUM: ", round(aum, 2))), hjust = 0, size = 5) +
+  geom_richtext(data = rrc_coefs, aes(x = 100, y = 5, label = paste0("<span style='color:#78695F; font-size:10pt'>*Number of observations: ", num_obs, "*</span>")), hjust = 1, color = "transparent", fill = alpha("white", .5), size = 5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(vars(factor(region, levels = c("South", "Midwest", "West", "Northeast"))), ncol = 2) +
+  scale_y_continuous(lim = c(0,100), expand = c(0, 0)) +
+  scale_x_continuous(lim = c(0,100), expand = c(0.01, 0.01)) +
+  labs(x = "Parent income rank",
+       y = "Mean child income rank",
+       # title = "Benchmark Rank-Rank Correlation and Absolute Upward Mobility",
+       caption = "Parent income: family total pretax income (avg. 30-50 yrs old) | Child income: family total pretax income (avg. 30-50 yrs old") +
+  theme(legend.position = "none",
+        strip.text = element_text(size = 14, face = "bold"),
+        panel.spacing.x = unit(2, "lines"))
+rrc_cef_baseline
+my.ggsave(paste0(figure_path, "benchmark_geo_family.pdf"))
+```
+
+### Robustness
+
+#### Only SRC Sample
+
+##### Rank variable creation
+
+```{r}
+# obtain benchmark RRCs
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains("rank"))
+
+child_sample_clean <- child_sample_clean %>% 
+  left_join(c(child_inc_vars, parent_inc_vars) |> 
+              map(~ gen_ranks(dt = child_sample_clean |> 
+                                filter(core_sample == T & itw_num_cat == "Member of, or moved into, a family from the 1968 SRC cross-section sample"),
+                              inc = .x)) %>%
+              reduce(left_join, by ="ind_id_68"))
+child_sample_clean %>% names()
+
+dt_reg <- child_sample_clean |> filter(core_sample == T & itw_num_cat == "Member of, or moved into, a family from the 1968 SRC cross-section sample")
+```
+
+##### RRC + Matrix - Baseline
+
+```{r}
+# estimate rank-rank correlations (including birth year FEs)
+rrc_coefs <- map2_dfr(.x = "mean_family_total_income_real_3050", .y = "parent_mean_mean_family_total_income_real_3050",
+                      ~ tidy(lm(formula(paste0("rank_", .x, "~ rank_", .y, " + factor(birth_year)")), data = dt_reg)) %>% 
+                        filter(grepl("rank", term)) %>% 
+                        mutate(child_inc_var = .x,
+                               child_inc_var_lab = child_inc_vars_labs[which(child_inc_vars == .x)],
+                               parent_inc_var_lab = parent_inc_vars_labs[which(parent_inc_vars == .y)],
+                               num_obs = nobs(lm(formula(paste0("rank_", .x, "~ rank_", .y, " + factor(birth_year)")), data = dt_reg))) %>% 
+                        select(child_inc_var, child_inc_var_lab, parent_inc_var = term, parent_inc_var_lab, coef = estimate, se = std.error, num_obs))
+
+# graph of baseline RRC CEF
+n_obs <- rrc_coefs |> pull(num_obs) |> unique() |> formatC(format = "d", big.mark = ",")
+
+rrc_cef_baseline <- dt_reg %>% 
+  select(rank_child = rank_mean_family_total_income_real_3050,
+         rank_parent = rank_parent_mean_mean_family_total_income_real_3050) |> 
+  group_by(rank_parent) %>% 
+  summarise(mean_rank_child = mean(rank_child)) %>% 
+  ggplot(aes(x = rank_parent, y = mean_rank_child)) +
+  geom_point(alpha = .8) +
+  geom_text(data = rrc_coefs, aes(x = 1, y = 90, label = paste0("RRC: ", round(coef, 3), " (", round(se, 3), ")")), hjust = 0, size = 5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_y_continuous(lim = c(0,100), expand = c(0, 0)) +
+  scale_x_continuous(lim = c(0,100), expand = c(0.01, 0.01)) +
+  labs(x = "Parent income rank",
+       y = "Mean child income rank",
+       title = "Benchmark Rank-Rank Correlation",
+       # subtitle = "Parent income: family total pretax income 30-50 | Child income: family total pretax income 30-50",
+       # caption = paste0("Naive standard errors in parenthesis. Number of children: ", n_obs)
+  ) +
+  theme(legend.position = "none")
+rrc_cef_baseline
+
+# estimate transition matrices
+matrix <- 
+  map2_dfr(.x = "mean_family_total_income_real_3050", .y = "parent_mean_mean_family_total_income_real_3050", 
+           ~ dt_reg |> 
+             select(ind_id_68, all_of(paste0("rank_", c(.x, .y)))) |> 
+             mutate(across(paste0("rank_", c(.x, .y)), ~ case_when(. %in% 1:20 ~ "Bottom 20%",
+                                                                   . %in% 21:40 ~ "Quintile 2",
+                                                                   . %in% 41:60 ~ "Quintile 3",
+                                                                   . %in% 61:80 ~ "Quintile 4",
+                                                                   . %in% 81:100 ~ "Top 20%"),
+                           .names = "{.col}_quintile"),
+                    across(paste0("rank_", c(.x, .y), "_quintile"), ~ factor(., levels = c("Bottom 20%", "Quintile 2", "Quintile 3", "Quintile 4", "Top 20%"))),
+                    child_inc_var = .x,
+                    child_inc_var_lab = child_inc_vars_labs[which(child_inc_vars == .x)],
+                    parent_inc_var = .y,
+                    parent_inc_var_lab = parent_inc_vars_labs[which(parent_inc_vars == .y)]) |> 
+             select(ind_id_68, child_inc_var, child_inc_var_lab, parent_inc_var, parent_inc_var_lab,
+                    child_inc_rank = paste0("rank_", .x), parent_inc_rank = paste0("rank_", .y),
+                    child_inc_quintile = paste0("rank_", .x, "_quintile"), parent_inc_quintile = paste0("rank_", .y, "_quintile")))
+
+matrix_baseline <- matrix |> 
+  group_by(child_inc_var, child_inc_var_lab, parent_inc_var, parent_inc_var_lab, parent_inc_quintile, child_inc_quintile) %>% 
+  summarise(n_obs = n()) %>% 
+  group_by(child_inc_var, child_inc_var_lab, parent_inc_var, parent_inc_var_lab, parent_inc_quintile) %>% 
+  mutate(pct = n_obs/sum(n_obs)) %>% 
+  ungroup() |> 
+  ggplot(aes(x = parent_inc_quintile, y = pct, fill = fct_rev(child_inc_quintile))) +
+  geom_col(position = "fill") +
+  geom_text(aes(y = pct, label = paste0(round(pct*100,2), "%")), position = position_fill(vjust = .5),
+            show.legend = FALSE, color = "white", size = 4) +
+  scale_fill_manual(values = alpha(my_palette[c(5,4,3,2,1)], alpha)) +
+  scale_y_continuous(expand = c(0,0), labels = scales::percent) +
+  scale_x_discrete(expand = c(0,0)) +
+  labs(x = "Parent income quintile",
+       y = NULL,
+       title = "Benchmark Transition Matrix",
+       fill = "Child income\nquintile:") +
+  theme(legend.position = "right",
+        panel.grid.major = element_blank(),
+        legend.key = element_rect(linewidth = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(2, "cm"),
+        legend.key.width = unit(1, "cm"))
+matrix_baseline
+
+patchwork <- rrc_cef_baseline + matrix_baseline + plot_annotation(caption = paste0("Naive standard errors in parenthesis. Number of children: ", n_obs, "\nParent income: family total pretax income (avg. 30-50 yrs old) | Child income: family total pretax income (avg. 30-50 yrs old)"))
+patchwork +
+  plot_annotation(tag_levels = "A")
+my.ggsave(paste0(figure_path, "benchmark_estimates_src_sample.pdf"))
+```
+
+# TSTSLS Results
+
+## Setup
+
+```{r}
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+parents_sample_clean <- parents_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+
+# convert instruments to factors
+parents_sample_clean <- parents_sample_clean %>% 
+  mutate(state = as.character(state),
+         birth_year = as.character(birth_year),
+         race = as.character(race))
+
+# full set of instruments to keep sample constant
+dem_chars <- c("birth_year", "race")
+full_instru = c("edu_level", "occ_3_digit_3050", dem_chars, "state")
+
+# instruments
+instru = list(full_instru[1], full_instru[1:2], full_instru[1:4], full_instru[1:5])
+# instruments labels
+full_instru_labs <- c("education", "occupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs = list(full_instru_labs[1],
+                   paste0(full_instru_labs[1:2], collapse = " + "),
+                   paste0(full_instru_labs[1:4], collapse = " + "),
+                   paste0(full_instru_labs[1:5], collapse = " + "))
+
+# instruments labels
+instru_labs_regions = rep(list(full_instru_labs[1],
+                               paste0(full_instru_labs[1:2], collapse = " + "),
+                               paste0(full_instru_labs[1:4], collapse = " + "),
+                               paste0(full_instru_labs[1:5], collapse = " + ")), length(regions))
+region_labs = rep(regions, each = length(instru))
+```
+
+## First-stage parameters
+
+```{r}
+# parameters
+parent_inc = "labor income"
+parent_age_min = 30
+parent_age_max = 50
+parent_inc_var = paste0("mean_", str_replace_all(parent_inc, " ", "_"), "_real_", parent_age_min, parent_age_max)
+parent_inc_pred_def = "sum"
+n_parent_inc_obs = 1
+
+child_inc = "family total income"
+child_age_min = 30
+child_age_max = 50
+child_inc_var = paste0("mean_", str_replace_all(child_inc, " ", "_"), "_real_", child_age_min, child_age_max)
+```
+
+## Obtain individual weights
+
+Following an email exchange with Bhash Mazumder, we'll use 2 weights:
+
+(i) family longitudinal weights for the last income observation year
+
+(ii) individual longitudinal weights for the last income observation year
+
+(iii) individual cross-sectional weights for the last income observation year
+
+### Individual file
+
+```{r}
+# individual file
+ind_2019 <- fread(paste0(data_path, "ind2019er/IND2019ER.csv"))
+ind_2019 <- ind_2019 %>% 
+  mutate(fam_id_68 = ER30001,
+         person_num_68 = ER30002,
+         ind_id_68 = fam_id_68*1000 + person_num_68,
+         gender = case_when(ER32000 == 1 ~ "Male",
+                            ER32000 == 2 ~ "Female"))
+setDT(ind_2019)
+
+fam_id_vars <- psid_vars %>% filter(var_id == 8746) %>% pull(variable)
+itw_num_vars <- psid_vars %>% filter(var_id == 419) %>% pull(variable)
+```
+
+### 2019 individual cross sectional weights (OLD)
+
+```{r}
+# 2019 individual cross sectional weights
+# child_sample_clean <- child_sample_clean |> 
+#   left_join(ind_2019 |> select(ind_id_68, ind_weights = ER34864))
+# child_sample_clean |> count(ind_weights == 0) |> count_to_pct() # 24% have 0 weight
+```
+
+### 2019 family longitudinal weights (OLD)
+
+```{r}
+# 2019 family longitudinal weights
+# fam_long_weights_vars <- psid_vars %>% filter(var_id == 8678 & year %in% 2019) %>% pull(variable)
+# 
+# child_sample_clean <- child_sample_clean |>
+#   left_join(ind_2019 |> select(ind_id_68, itw_num = all_of(itw_num_vars))) |> 
+#   left_join(fam_2019 |> select(itw_num = all_of(fam_id_vars), fam_long_weights = all_of(fam_long_weights_vars)))
+# child_sample_clean |> count(is.na(fam_long_weights)) |> count_to_pct() # 24% have missing weight because not observed in 2019
+```
+
+### Family longitudinal weights for last year of child income obs.
+
+```{r}
+# family longitudinal weights for last year of child income observation
+# obtain last income observation year for all children
+last_inc_year <- child_sample_long |> 
+  filter(substr(rel_head, 1, 1) %in% 1:2 & # head or spouse
+           (age-1) %in% child_age_min:child_age_max & # age - 1 because income measured in T refers to income earned in T-1
+           (accuracy_family_tax_income != 2 | is.na(accuracy_family_tax_income)) & # income not significant adjustment
+               family_tax_income != 9999999 & family_transfers_income != 9999999) |> 
+  group_by(ind_id_68) |> 
+  summarise(last_year = max(year))
+last_inc_year |> count(last_year, sort = T) |> count_to_pct() # 68% in 2019
+
+# get variable weights for each year
+wt_vars <- bind_cols(year = years,
+                     ind_long_weights_var = c(psid_vars %>% filter(var_id == 8683) |> filter(!is.na(variable)) |> pull(variable),
+                     psid_vars %>% filter(var_id == 8679) |> filter(!is.na(variable)) |> pull(variable),
+                     psid_vars %>% filter(var_id == 8681) |> filter(!is.na(variable) & year == 1996) |> pull(variable), # longitudinal weights for combined core and latino revised 1993 are not available in 1996 for some reason so I take the core only weights
+                     psid_vars %>% filter(var_id == 8678) |> filter(!is.na(variable)) |> pull(variable)))
+
+# obtain weights from family files
+fam_long_wt_values <- var_fam_fct(variables = wt_vars |> pull(ind_long_weights_var),
+                         name = "family_long_weights")
+
+# obtain individual identifier
+fam_long_wt_values <- child_sample_long |>
+  left_join(last_inc_year) |> 
+  filter(year == last_year) |> 
+  left_join(fam_long_wt_values) |> 
+  select(ind_id_68, family_long_weights)
+
+# add weights to child_sample_clean
+child_sample_clean <- child_sample_clean |> 
+  left_join(fam_long_wt_values)
+
+child_sample_clean |> count(is.na(family_long_weights)) |> count_to_pct() # missing for 3%
+```
+
+### Individual longitudinal weights for last year of child income obs.
+
+```{r}
+# family longitudinal weights for last year of child income observation
+# obtain last income observation year for all children
+last_inc_year <- child_sample_long |> 
+  filter(substr(rel_head, 1, 1) %in% 1:2 & # head or spouse
+           (age-1) %in% child_age_min:child_age_max & # age - 1 because income measured in T refers to income earned in T-1
+           (accuracy_family_tax_income != 2 | is.na(accuracy_family_tax_income)) & # income not significant adjustment
+               family_tax_income != 9999999 & family_transfers_income != 9999999) |> 
+  group_by(ind_id_68) |> 
+  summarise(last_year = max(year))
+last_inc_year |> count(last_year, sort = T) |> count_to_pct() # 68% in 2019
+
+# get variable weights for each year
+wt_vars <- bind_cols(year = years,
+                     ind_long_weights_var = c(psid_vars %>% filter(var_id == 394) |> filter(!is.na(variable)) |> pull(variable),
+                     psid_vars %>% filter(var_id == 391) |> filter(!is.na(variable)) |> pull(variable),
+                     psid_vars %>% filter(var_id == 393) |> filter(!is.na(variable) & year == 1996) |> pull(variable), # longitudinal weights for combined core and latino revised 1993 are not available in 1996 for some reason so I take the core only weights
+                     psid_vars %>% filter(var_id == 390) |> filter(!is.na(variable)) |> pull(variable)))
+
+wt_values <- ind_2019 |>
+  select(ind_id_68, all_of(wt_vars$ind_long_weights_var)) |>
+  pivot_longer(cols = -ind_id_68,
+               names_to = "ind_long_weights_var",
+               values_to = "ind_long_weights")
+wt_values <- wt_values |> 
+  left_join(wt_vars)
+
+# add weights variable to last income year data.frame
+last_inc_year <- last_inc_year |> 
+  left_join(wt_values |> rename(last_year = year))
+
+# obtain last income obs. weight in child_sample_clean
+child_sample_clean <- child_sample_clean |> 
+  left_join(last_inc_year)
+child_sample_clean |> count(is.na(ind_long_weights)) |> count_to_pct() # missing for 5%
+```
+
+### Individual cross-sectional weights for last year of child income obs.
+
+Only available from 1997 onwards.
+
+```{r}
+# family longitudinal weights for last year of child income observation
+# obtain last income observation year for all children
+last_inc_year <- child_sample_long |> 
+  filter(substr(rel_head, 1, 1) %in% 1:2 & # head or spouse
+           (age-1) %in% child_age_min:child_age_max & # age - 1 because income measured in T refers to income earned in T-1
+           (accuracy_family_tax_income != 2 | is.na(accuracy_family_tax_income)) & # income not significant adjustment
+               family_tax_income != 9999999 & family_transfers_income != 9999999) |> 
+  group_by(ind_id_68) |> 
+  summarise(last_year = max(year))
+last_inc_year |> count(last_year, sort = T) |> count_to_pct() # 68% in 2019
+
+# get variable weights for each year
+wt_vars <- psid_vars %>% filter(var_id == 389) |> filter(!is.na(variable)) |> select(year, ind_cross_sec_weights_var = variable)
+
+wt_values <- ind_2019 |>
+  select(ind_id_68, all_of(wt_vars$ind_cross_sec_weights_var)) |>
+  pivot_longer(cols = -ind_id_68,
+               names_to = "ind_cross_sec_weights_var",
+               values_to = "ind_cross_sec_weights")
+wt_values <- wt_values |> 
+  left_join(wt_vars)
+
+# add weights variable to last income year data.frame
+last_inc_year <- last_inc_year |> 
+  left_join(wt_values |> mutate(year = as.numeric(year)) |> rename(last_year = year))
+
+# obtain last income obs. weight in child_sample_clean
+child_sample_clean <- child_sample_clean |> 
+  left_join(last_inc_year)
+child_sample_clean |> count(is.na(ind_cross_sec_weights)) |> count_to_pct() # missing for 6%
+```
+
+## First-stage estimation
+
+*Predictors:* - education level (7 categories) - occupation (446 cat.) - demographic characteristics (birth cohort, race (5 cat.) - location of residence characteristics -\> state FE
+
+*Questions:* 1) should we bootstrap parents' sample as in Jerrim et al.? -\> NO 2) how should we do out of sample prediction? -\> 5-fold cross-validation 3) Should I have multiple observations for parents' with several children? -\> NO
+
+*Notes:* 1. Lee and Solon (2009) and Mazumder (2016) restrict their analysis to the SRC (Survey Research Center) component of the PSID, i.e., the nationally-representative part. For us, it doesn't matter so much (though it quite significantly reduces the sample size) but we do this as a robustness check.
+
+```{r}
+# estimate first-stage ----
+# parent sample - obtain incomes
+parents_sample_clean <- parents_sample_clean %>%
+  left_join(inc_fct(dt = parents_sample_long,
+                    inc_var = parent_inc,
+                    age_range = parent_age_min:parent_age_max,
+                    zero_to_na = replace_zero_incomes) %>% 
+              mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .))))
+# child sample - obtain incomes
+child_sample_clean <- child_sample_clean %>%
+  filter(core_sample == T) |> 
+  left_join(inc_fct(dt = child_sample_long,
+                    inc_var = child_inc,
+                    age_range = child_age_min:child_age_max,
+                    zero_to_na = replace_zero_incomes))
+
+# first-stage
+set.seed(1234)
+fs_predict <- 1:length(instru) %>% 
+  map(~ tstsls_fct(dt = parents_sample_clean,
+                   dt_child = child_sample_clean,
+                   instruments = instru[[.x]],
+                   constant_instruments = NULL,
+                   parent_inc_var = parent_inc_var,
+                   replace_0_income = NULL,
+                   fs_log_inc = T,
+                   parent_inc_pred_def = parent_inc_pred_def,
+                   child_inc_var = child_inc_var,
+                   n_parent_inc_obs = n_parent_inc_obs))
+# ----
+```
+
+#### Out-of-sample predictions
+
+##### Individual-level
+
+```{r}
+# prediction vs observed individual income graph ----
+indiv_pred_graphs <- 1:length(instru) %>% 
+  map(~ indiv_pred_graph(dt = fs_predict[[.x]][[9]],
+                         caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                   instru_labels = instru_labs[[.x]])))
+wrap_plots(map(indiv_pred_graphs, 1))
+ggsave(paste0(figure_path, "baseline_indiv_prediction_graphs.pdf"),
+       height = fig_height, width = fig_width)
+
+wrap_plots(map(indiv_pred_graphs, 2))
+ggsave(paste0(figure_path, "baseline_indiv_prediction_rank_graphs.pdf"),
+       height = fig_height, width = fig_width)
+
+wrap_plots(map(indiv_pred_graphs, 3), guides = "collect", nrow = 2) & theme(legend.position = "top") 
+ggsave(paste0(figure_path, "baseline_indiv_prediction_quintile_graphs.pdf"),
+       height = fig_height*1.5, width = fig_width)
+
+# export data for paper graphs
+indiv_pred_graphs <- 1:length(instru) %>% 
+  map(~ indiv_pred_graph(dt = fs_predict[[.x]][[9]],
+                         by_gender = F,
+                         caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                   instru_labels = instru_labs[[.x]])))
+fwrite(indiv_pred_graphs[[4]][[4]], here("data/figures_raw_data/baseline_indiv_prediction_rank_graphs.csv"))
+# ----
+```
+
+##### Household-level
+
+```{r}
+# prediction vs observed family income graph ----
+graphs_prediction <- 1:length(instru) %>% 
+  map(~ prediction_graph(dt = fs_predict[[.x]][[1]],
+                         caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                   instru_labels = instru_labs[[.x]])))
+wrap_plots(graphs_prediction, nrow = 2)
+ggsave(paste0(figure_path, "baseline_family_prediction_graphs.pdf"),
+       height = fig_height, width = fig_width)
+# ----
+
+# prediction vs observed income rank graph ----
+graphs_prediction_rank <- 1:length(instru) %>% 
+  map(~ prediction_rank_graph(dt = fs_predict[[.x]][[1]],
+                              caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                        instru_labels = instru_labs[[.x]])))
+wrap_plots(graphs_prediction_rank, nrow = 2)
+ggsave(paste0(figure_path, "baseline_family_prediction_rank_graphs.pdf"),
+       height = fig_height, width = fig_width)
+# ----
+
+# prediction vs observed income quintile graph ----
+graphs_quintile <- 1:length(instru) %>% 
+  map(~ prediction_quintile_graph(dt = fs_predict[[.x]][[1]],
+                                  caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                            instru_labels = instru_labs[[.x]])))
+wrap_plots(graphs_quintile, guides = "collect", nrow = 2) & theme(legend.position = "top")
+ggsave(paste0(figure_path, "baseline_family_prediction_quintile_graphs.pdf"),
+       height = fig_height*1.5, width = fig_width)
+# ----
+```
+
+## National-level results
+
+### IGE - All FS
+
+```{r}
+# IGE comparison graph ----
+graphs_ige <- 1:length(instru) %>% 
+  map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                       instru_labels = instru_labs[[.x]]),
+                             title_size = title_size,
+                             text_size = text_size,
+                             annotation_size = 5))
+wrap_plots(graphs_ige, nrow = 2)
+ggsave(paste0(figure_path, "baseline_ige_comp_graphs.pdf"),
+       height = fig_height, width = fig_width)
+
+coefs_ige <- 1:length(instru) %>% 
+  map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_ige, here("data/figures_raw_data/baseline_ige_coefs.csv"))
+# ----
+```
+
+### RRC - All FS
+
+```{r}
+# RRC comparison graph ----
+graphs_rrc <- 1:length(instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                       instru_labels = instru_labs[[.x]]),
+                             
+                             title_size = title_size,
+                             text_size = text_size,
+                             annotation_size = 5))
+wrap_plots(graphs_rrc, nrow = 2)
+ggsave(paste0(figure_path, "baseline_rrc_comp_graphs.pdf"),
+       height = fig_height, width = fig_width)
+
+# export underlying data
+data_rrc <- fs_predict[[4]][[1]]
+write_rds(data_rrc, here("data/figures_raw_data/data_rrc.rds"))
+# ----
+
+coefs_rrc <- 1:length(instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_rrc, here("data/figures_raw_data/baseline_rrc_coefs.csv"))
+```
+
+### Matrix - All FS
+
+```{r}
+# transition matrix comparison graph ----
+full_instru_labs_new <- c("education", "occupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+graphs_matrix <- 1:length(instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                         instru_labels = instru_labs_new[[.x]]),
+                               title_size = 8,
+                               ols_legend_none = T,
+                               tstsls_legend_none = T,
+                               pct_size = 2.5,
+                               n_dodge = 2))
+wrap_plots(map(graphs_matrix, 1), nrow = 2)
+# graphs_matrix[[1]][[2]] + (wrap_plots(map(graphs_matrix, 3), nrow = 2, guides = "collect") & theme(legend.position = 'top')) + plot_layout(widths = c(.3, .7))
+ggsave(paste0(figure_path, "baseline_matrix_comp_graphs.pdf"),
+       height = fig_height*1.5, width = fig_width)
+
+coefs_matrix <- 1:length(instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_matrix, here("data/figures_raw_data/baseline_matrix_coefs.csv"))
+# ----
+```
+
+
+### Comparison table
+
+```{r}
+coefs_ige <- fread(here("data/figures_raw_data/baseline_ige_coefs.csv"))
+coefs_rrc <- fread(here("data/figures_raw_data/baseline_rrc_coefs.csv"))
+coefs_matrix <- fread(here("data/figures_raw_data/baseline_matrix_coefs.csv"))
+
+comp_instru <- bind_rows(
+  coefs_ige |>
+    mutate(spec = "baseline",
+           instru = case_when(instru == instru_labs[[1]] ~ "education",
+                              instru == instru_labs[[2]] ~ "+ occupation (3-digit)",
+                              instru == instru_labs[[3]] ~ "+ race + birth cohort",
+                              instru == instru_labs[[4]] ~ "+ state FE")) |> 
+    group_by(instru) |> 
+    mutate(pct_diff = (lag(ige) - ige)/ige*100) |> 
+    ungroup()|> 
+    mutate(coef = paste0(round(ige, 3)),
+           se = paste0("(", round(se_ige, 3), ")"),
+           pct_diff = paste0(round(pct_diff, 2), "%"),
+           n_obs = formatC(n_obs, format = "d", big.mark = ",")) |> 
+    select(parent_inc_var, instru, coef, se, pct_diff, n_obs) |> 
+    pivot_longer(cols = -c(parent_inc_var, instru),
+                 names_to = "stat") |>
+    pivot_wider(names_from = instru),
+  coefs_rrc |>
+    mutate(spec = "baseline",
+           instru = case_when(instru == instru_labs[[1]] ~ "education",
+                              instru == instru_labs[[2]] ~ "+ occupation (3-digit)",
+                              instru == instru_labs[[3]] ~ "+ race + birth cohort",
+                              instru == instru_labs[[4]] ~ "+ state FE")) |> 
+    group_by(instru) |> 
+    mutate(pct_diff = (lag(rrc) - rrc)/rrc*100) |> 
+    ungroup()|> 
+    mutate(coef = paste0(round(rrc, 3)),
+           se = paste0("(", round(se_rrc, 3), ")"),
+           pct_diff = paste0(round(pct_diff, 2), "%"),
+           n_obs = formatC(n_obs, format = "d", big.mark = ",")) |> 
+    select(parent_inc_var, instru, coef, se, pct_diff, n_obs) |> 
+    pivot_longer(cols = -c(parent_inc_var, instru),
+                 names_to = "stat") |>
+    pivot_wider(names_from = instru),
+  coefs_matrix |>
+    filter(rank_parent_quintile %in% c("Bottom 20%", "Top 20%") & rank_child_quintile %in% c("Bottom 20%", "Top 20%")) |> 
+    mutate(spec = "baseline",
+           mat_cell = case_when(rank_parent_quintile == "Bottom 20%" & rank_child_quintile == "Top 20%" ~ "P(Top 20% | Bottom 20%)",
+                                rank_parent_quintile == "Bottom 20%" & rank_child_quintile == "Bottom 20%" ~ "P(Bottom 20% | Bottom 20%)",
+                                rank_parent_quintile == "Top 20%" & rank_child_quintile == "Top 20%" ~ "P(Top 20% | Top 20%)",
+                                rank_parent_quintile == "Top 20%" & rank_child_quintile == "Bottom 20%" ~ "P(Bottom 20% | Top 20%)"),
+           instru = case_when(instru == instru_labs[[1]] ~ "education",
+                              instru == instru_labs[[2]] ~ "+ occupation (3-digit)",
+                              instru == instru_labs[[3]] ~ "+ race + birth cohort",
+                              instru == instru_labs[[4]] ~ "+ state FE")) |> 
+    # group_by(instru, mat_cell) |> 
+    # mutate(pct_diff = (lag(pct) - pct)/pct*100) |> 
+    # ungroup() |> 
+    mutate(coef = paste0(round(pct*100, 2), "%"),
+           n_obs = formatC(n_obs, format = "d", big.mark = ",")) |>
+    select(parent_inc_var = method, mat_cell, instru, coef) |>
+    pivot_longer(cols = -c(parent_inc_var, mat_cell, instru),
+                 names_to = "stat") |>
+    pivot_wider(names_from = instru) |> 
+    arrange(mat_cell))
+setDT(comp_instru)
+comp_instru <- comp_instru[-c(3, 4, 11, 12),]
+
+comp_instru_clean <- comp_instru |> 
+  mutate(parent_inc_var = case_when(parent_inc_var %in% c("parent_inc", "rank_parent")  & stat == "coef" ~ "Observed parent income (OLS)",
+                                    parent_inc_var %in% c("parent_inc_predict", "rank_parent_predict") & stat == "coef" ~ "Predicted parent income (TSTSLS)",
+                                    stat == "se" ~ "",
+                                    stat == "pct_diff" ~ "Percentage diff. TSTSLS vs OLS",
+                                    stat == "n_obs" ~ "Number of observations",
+                                    !is.na(mat_cell) & parent_inc_var == "ols" ~ paste0(mat_cell, " (OLS)"),
+                                    !is.na(mat_cell) & parent_inc_var == "tstsls" ~ paste0(mat_cell, " (TSTSLS)"),
+                                    TRUE ~ "")) |> 
+  select(-c(stat, mat_cell))
+comp_instru_clean
+
+n_columns <- ncol(comp_instru_clean) - 1
+kbl(comp_instru_clean, "latex",
+    booktabs = T,
+    caption = "Comparison for Different Sets of Predictors",
+    label = "fs_instru",
+    linesep = "\\smallskip",
+    col.names = c("", paste0("(", 1:n_columns,")")),
+    escape = TRUE,
+    align = c("l", rep("c", n_columns))) %>%
+  kable_styling(position = "center", latex_options = c("scale_down")) %>% 
+  footnote(general_title = "Notes:", general = "", threeparttable = TRUE, footnote_as_chunk = T) %>%
+  add_header_above(c("",
+                     "Education" = 1,
+                     "+ occupation (3-digit)" = 1,
+                     "+ race + birth cohort" = 1,
+                     "+ state FE" = 1), line = F, escape = FALSE) %>% 
+  pack_rows("Panel A. Intergenerational Elasticity (IGE)", 1, 6, bold = F, italic = T) %>%
+  pack_rows("Panel B. Rank-Rank Correlation (RRC)", 7, 12, bold = F, italic = T) %>%
+  pack_rows("Panel C. Transition Matrix", 13, 20, bold = F, italic = T) |>
+  save_kable(file = paste0(figure_path, "comp_instru.tex"))
+```
+
+
+### RRC - Baseline
+
+```{r}
+baseline_rrc <- graphs_rrc[[4]]
+baseline_rrc
+my.ggsave(paste0(figure_path, "baseline_rrc.pdf"))
+```
+
+### Transition matrices - Baseline
+
+```{r}
+baseline_matrix <- matrix_predicted_graph(dt = fs_predict[[4]][[1]],
+                                          caption_lab = caption_fct(fs = fs_predict[[4]][[8]],
+                                                                    instru_labels = instru_labs_new[[4]]),
+                                          title_size = title_size,
+                                          ols_legend_none = T,
+                                          tstsls_legend_none = F,
+                                          legend_size = 12,
+                                          pct_size = 4,
+                                          n_dodge = 1)
+
+baseline_matrix_tstsls <- baseline_matrix[[3]] +
+  labs(title = "TSTSLS") +
+  guides(fill = guide_legend(reverse = F)) +
+  theme(legend.key = element_rect(linewidth = 5),
+        legend.key.size = unit(1, 'lines'),
+        legend.key.height = unit(2, "cm"),
+        legend.key.width = unit(1, "cm"))
+baseline_matrix_ols <- baseline_matrix[[2]]
+baseline_matrix_graph <- baseline_matrix_ols + baseline_matrix_tstsls
+baseline_matrix_graph
+my.ggsave(paste0(figure_path, "baseline_matrix.pdf"))
+```
+
+### RRC + Transition Matrix - Baseline
+
+```{r}
+baseline_matrix <- matrix_predicted_graph(dt = fs_predict[[4]][[1]],
+                                          caption_lab = caption_fct(fs = fs_predict[[4]][[8]],
+                                                                    instru_labels = instru_labs_new[[4]]),
+                                          title_size = title_size,
+                                          ols_legend_none = F,
+                                          tstsls_legend_none = F,
+                                          legend_size = 10,
+                                          pct_size = 3,
+                                          n_dodge = 2)
+
+patchwork <- (baseline_rrc + labs(title = "Rank-Rank Correlation")) +
+  (((baseline_matrix[[2]] + guides(fill = guide_legend(reverse = F))) /
+      (baseline_matrix[[3]] + labs(title = "TSTSLS")  + guides(fill = guide_legend(reverse = F))) +
+      plot_layout(guides = "collect")) &
+     theme(legend.position = "right",
+           legend.key = element_rect(linewidth = 5),
+           legend.key.size = unit(1, 'lines'),
+           legend.key.height = unit(2, "cm"),
+           legend.key.width = unit(0.5, "cm")))
+patchwork +
+  plot_annotation(tag_levels = "A") + plot_layout(widths = c(.6, .5))
+my.ggsave(paste0(figure_path, "benchmark_estimates_ols_tstsls.pdf"))
+```
+
+### With sampling weights
+
+```{r}
+weights_used = c("family_long_weights", "ind_long_weights", "ind_cross_sec_weights")
+
+for (i in weights_used) {
+  # IGE comparison graph ----
+  graphs_ige <- 1:length(instru) %>%
+    map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                               weights = i,
+                               caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                         instru_labels = instru_labs[[.x]]),
+                               title_size = title_size,
+                               text_size = text_size,
+                               annotation_size = 5))
+  wrap_plots(graphs_ige, nrow = 2)
+  ggsave(paste0(figure_path, "baseline_ige_comp_graphs_", i, ".pdf"),
+         height = fig_height, width = fig_width)
+  
+  coefs_ige <- 1:length(instru) %>% 
+    map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                               weights = i,
+                               keep_data = T) |> 
+          mutate(instru = instru_labs[[.x]])) |> 
+    bind_rows()
+  fwrite(coefs_ige, here(paste0("data/figures_raw_data/coefs_ige_", i, ".csv")))
+  # ----
+  
+  # RRC comparison graph ----
+  graphs_rrc <- 1:length(instru) %>%
+    map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                               weights = i,
+                               caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                         instru_labels = instru_labs[[.x]]),
+                               
+                               title_size = title_size,
+                               text_size = text_size,
+                               annotation_size = 5))
+  wrap_plots(graphs_rrc, nrow = 2)
+  ggsave(paste0(figure_path, "baseline_rrc_comp_graphs_", i, ".pdf"),
+         height = fig_height, width = fig_width)
+  
+  coefs_rrc <- 1:length(instru) %>% 
+    map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                               weights = i,
+                               keep_data = T) |> 
+          mutate(instru = instru_labs[[.x]])) |> 
+    bind_rows()
+  fwrite(coefs_rrc, here(paste0("data/figures_raw_data/coefs_rrc_", i, ".csv")))
+  # ----
+  
+  # geographic-level ----
+  instru_reg = rep(1:length(instru), length(regions))
+  regions_reg <- rep(regions, each = length(instru))
+  
+  full_instru_labs_new <- c("education", "\noccupation (3-digit)", "race", "\nbirth cohort", "state FE")
+  instru_labs_new = list(full_instru_labs_new[1],
+                         paste0(full_instru_labs_new[1:2], collapse = " + "),
+                         paste0(full_instru_labs_new[1:4], collapse = " + "),
+                         paste0(full_instru_labs_new[1:5], collapse = " + "))
+  coefs_rrc <- map2(.x = instru_reg,
+                    .y = regions_reg,
+                    ~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]] |> filter(region == .y),
+                                           weights = i,
+                                           keep_data = T) |> 
+                      mutate(instru = .x,
+                             region = .y)) |> 
+    bind_rows()
+  fwrite(coefs_rrc, here(paste0("data/figures_raw_data/coefs_rrc_region_", i, ".csv")))
+  # ----
+}
+```
+
+## Geographic-level results
+
+Considering the sample size (5,088 children), we estimate intergenerational mobility only at the macro region level (4 categories).
+
+Census Bureau statistical regions: 1. Northeast 2. Midwest 3. South 4. West.
+
+### Setup
+
+```{r}
+instru_reg = rep(1:length(instru), length(regions))
+regions_reg <- rep(regions, each = length(instru))
+```
+
+### RRC and AUM - Baseline
+
+```{r}
+# RRC comparison graph ----
+rrc_x = 32
+aum_x = 52
+
+graphs_rrc <- map2(.x = instru_reg,
+                   .y = regions_reg,
+                   ~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]] |> filter(region == .y),
+                                          caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                                    instru_labels = instru_labs[[.x]]),
+                                          with_aum = T,
+                                          rank_parent_text = c(rep(c(rrc_x, aum_x, 3), 2), rrc_x, aum_x, 100),
+                                          mean_rank_child_text = c(rep(95, 2), rep(87, 3), rep(78, 3), 2),
+                                          with_caption = F,
+                                          title_size = 12,
+                                          text_size = 10,
+                                          num_obs_size = 8,
+                                          annotation_size = 3))
+
+wrap_plots(map(1:length(regions), ~ wrap_elements(wrap_plots(graphs_rrc[[4*.x]] + labs(title = NULL)) +
+                                                    plot_annotation(title = paste0("Region: ", regions[.x]),
+                                                                    theme = theme(plot.title = element_text(size = 11))))),
+           nrow = 2)
+my.ggsave(paste0(figure_path, "regions_baseline_comp_graph.pdf"))
+```
+
+### RRC and AUM - ALL
+
+```{r}
+full_instru_labs_new <- c("education", "\noccupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+
+rrc_x = 30
+aum_x = 75
+
+graphs_rrc <- map2(.x = instru_reg,
+                   .y = regions_reg,
+                   ~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]] |> filter(region == .y),
+                                          caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                                    instru_labels = instru_labs_new[[.x]]),
+                                          with_aum = T,
+                                          region_lab = T,
+                                          rank_parent_text = c(rep(c(rrc_x, aum_x, 1), 2), rrc_x, aum_x, 100),
+                                          mean_rank_child_text = c(rep(95, 2), rep(83, 3), rep(71, 3), 2),
+                                          with_caption = F,
+                                          title_size = 10,
+                                          text_size = 10,
+                                          num_obs_size = 8,
+                                          annotation_size = 3))
+
+wrap_plots(map(1:length(regions), ~ wrap_elements(wrap_plots(graphs_rrc[(4*.x-3):(4*.x)], ncol = length(instru)) +
+                                                    plot_annotation(title = paste0("Region: ", regions[.x]),
+                                                                    theme = theme(plot.title = element_text(size = 11))))),
+           nrow = length(regions))
+
+ggsave(paste0(figure_path, "regions_baseline_all_comp_graphs.pdf"),
+       height = 2*fig_height, width = fig_width)
+
+# underlying coefficients
+coefs_rrc <- map2(.x = instru_reg,
+                   .y = regions_reg,
+                   ~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]] |> filter(region == .y),
+                                          keep_data = T) |> 
+                     mutate(instru = .x,
+                            region = .y)) |> 
+  bind_rows()
+fwrite(coefs_rrc, here("data/figures_raw_data/baseline_coefs_rrc_region.csv"))
+```
+
+## Robustness
+
+### Dealing with zero labor incomes in PSID
+
+According to Mazumder (though it seems not according to the codebooks): "In the PSID, the household head is recorded as having zero labor income if their income was actually zero or if their labor income is missing, so one cannot cleanly distinguish true zeroes with labor income. All of the main analysis only uses years of non-zero income when constructing time averages of income." ([Mazumder, 2016, p. 101](zotero://select/library/items/IGV8QXK7)) ([pdf](zotero://open-pdf/library/items/CIE4Y835?page=19&annotation=RE8H2T4M))
+
+Thus I check what happens when dropping these zero labor incomes.
+
+#### First-stage estimation
+
+```{r}
+# estimate first-stage ----
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+parents_sample_clean <- parents_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+
+replace_zero_incomes = T
+
+# parent sample - obtain incomes
+parents_sample_clean <- parents_sample_clean %>%
+  left_join(inc_fct(dt = parents_sample_long,
+                    inc_var = parent_inc,
+                    age_range = parent_age_min:parent_age_max,
+                    zero_to_na = replace_zero_incomes) %>% 
+              mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .))))
+# child sample - obtain incomes
+child_sample_clean <- child_sample_clean %>%
+  filter(core_sample == T) |> 
+  left_join(inc_fct(dt = child_sample_long,
+                    inc_var = child_inc,
+                    age_range = child_age_min:child_age_max,
+                    zero_to_na = replace_zero_incomes))
+
+# first-stage
+set.seed(1234)
+fs_predict <- 1:length(instru) %>% 
+  map(~ tstsls_fct(dt = parents_sample_clean,
+                   dt_child = child_sample_clean,
+                   instruments = instru[[.x]],
+                   constant_instruments = NULL,
+                   parent_inc_var = parent_inc_var,
+                   replace_0_income = NULL,
+                   fs_log_inc = T,
+                   parent_inc_pred_def = parent_inc_pred_def,
+                   child_inc_var = child_inc_var,
+                   n_parent_inc_obs = n_parent_inc_obs))
+# ----
+
+# IGE comparison graph ----
+coefs_ige <- 1:length(instru) %>% 
+  map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_ige, here("data/figures_raw_data/coefs_ige_replace_zero_to_na.csv"))
+# ----
+
+# RRC comparison graph ----
+coefs_rrc <- 1:length(instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_rrc, here("data/figures_raw_data/coefs_rrc_replace_zero_to_na.csv"))
+# ----
+
+# transition matrix comparison graph ----
+full_instru_labs_new <- c("education", "occupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+coefs_matrix <- 1:length(instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_matrix, here("data/figures_raw_data/coefs_matrix_replace_zero_to_na.csv"))
+# ----
+
+# geographic-level ----
+instru_reg = rep(1:length(instru), length(regions))
+regions_reg <- rep(regions, each = length(instru))
+
+full_instru_labs_new <- c("education", "\noccupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+coefs_regions <- map2(.x = instru_reg,
+                      .y = regions_reg,
+                      ~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]] |> filter(region == .y),
+                                             keep_data = T) |> 
+                        mutate(instru = .x,
+                               region = .y)) |> 
+  bind_rows()
+fwrite(coefs_regions, here("data/figures_raw_data/coefs_region_replace_zero_to_na.csv"))
+# ----
+```
+
+#### RRC - All FS
+
+```{r}
+# RRC comparison graph ----
+graphs_rrc <- 1:length(instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                       instru_labels = instru_labs[[.x]]),
+                             
+                             title_size = title_size,
+                             text_size = text_size,
+                             annotation_size = 5))
+wrap_plots(graphs_rrc, nrow = 2)
+ggsave(paste0(figure_path, "baseline_rrc_comp_graphs_replace_zero_to_na.pdf"),
+       height = fig_height, width = fig_width)
+# ----
+```
+
+#### Matrix - All FS
+
+```{r}
+# transition matrix comparison graph ----
+full_instru_labs_new <- c("education", "occupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+graphs_matrix <- 1:length(instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                         instru_labels = instru_labs_new[[.x]]),
+                               title_size = 8,
+                               ols_legend_none = T,
+                               tstsls_legend_none = T,
+                               pct_size = 2.5,
+                               n_dodge = 2))
+wrap_plots(map(graphs_matrix, 1), nrow = 2)
+# graphs_matrix[[1]][[2]] + (wrap_plots(map(graphs_matrix, 3), nrow = 2, guides = "collect") & theme(legend.position = 'top')) + plot_layout(widths = c(.3, .7))
+ggsave(paste0(figure_path, "baseline_matrix_comp_graphs_replace_zero_to_na.pdf"),
+       height = fig_height*1.5, width = fig_width)
+# ----
+```
+
+### Dividing income by number of reference person/partner
+
+#### First-stage estimation
+
+```{r}
+# estimate first-stage ----
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+parents_sample_clean <- parents_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+
+replace_zero_incomes = F
+parent_inc_pred_def = "mean"
+child_inc_var = paste0("mean_", str_replace_all(child_inc, " ", "_"), "_real_n_", child_age_min, child_age_max)
+
+# parent sample - obtain incomes
+parents_sample_clean <- parents_sample_clean %>%
+  left_join(inc_fct(dt = parents_sample_long,
+                    inc_var = parent_inc,
+                    age_range = parent_age_min:parent_age_max) %>% 
+              mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .))))
+# child sample - obtain incomes
+child_sample_clean <- child_sample_clean %>%
+  filter(core_sample == T) |> 
+  left_join(inc_fct(dt = child_sample_long,
+                    inc_var = child_inc,
+                    age_range = child_age_min:child_age_max))
+
+# first-stage
+set.seed(1234)
+fs_predict <- 1:length(instru) %>% 
+  map(~ tstsls_fct(dt = parents_sample_clean,
+                   dt_child = child_sample_clean,
+                   instruments = instru[[.x]],
+                   constant_instruments = NULL,
+                   parent_inc_var = parent_inc_var,
+                   replace_0_income = NULL,
+                   fs_log_inc = T,
+                   parent_inc_pred_def = parent_inc_pred_def,
+                   child_inc_var = child_inc_var,
+                   n_parent_inc_obs = n_parent_inc_obs))
+# ----
+
+# IGE comparison graph ----
+coefs_ige <- 1:length(instru) %>% 
+  map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_ige, here("data/figures_raw_data/coefs_ige_div_num_adults.csv"))
+# ----
+
+# RRC comparison graph ----
+coefs_rrc <- 1:length(instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_rrc, here("data/figures_raw_data/coefs_rrc_div_num_adults.csv"))
+# ----
+
+# transition matrix comparison graph ----
+full_instru_labs_new <- c("education", "occupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+coefs_matrix <- 1:length(instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_matrix, here("data/figures_raw_data/coefs_matrix_div_num_adults.csv"))
+# ----
+
+# geographic-level ----
+instru_reg = rep(1:length(instru), length(regions))
+regions_reg <- rep(regions, each = length(instru))
+
+full_instru_labs_new <- c("education", "\noccupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+coefs_regions <- map2(.x = instru_reg,
+                      .y = regions_reg,
+                      ~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]] |> filter(region == .y),
+                                             keep_data = T) |> 
+                        mutate(instru = .x,
+                               region = .y)) |> 
+  bind_rows()
+fwrite(coefs_regions, here("data/figures_raw_data/coefs_region_div_num_adults.csv"))
+# ----
+```
+
+#### RRC - All FS
+
+```{r}
+# RRC comparison graph ----
+graphs_rrc <- 1:length(instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                       instru_labels = instru_labs[[.x]]),
+                             
+                             title_size = title_size,
+                             text_size = text_size,
+                             annotation_size = 5))
+wrap_plots(graphs_rrc, nrow = 2)
+ggsave(paste0(figure_path, "baseline_rrc_comp_graphs_div_num_adults.pdf"),
+       height = fig_height, width = fig_width)
+# ----
+```
+
+#### Matrix - All FS
+
+```{r}
+# transition matrix comparison graph ----
+full_instru_labs_new <- c("education", "occupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+graphs_matrix <- 1:length(instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               caption_lab = caption_fct(fs = fs_predict[[.x]][[8]],
+                                                         instru_labels = instru_labs_new[[.x]]),
+                               title_size = 8,
+                               ols_legend_none = T,
+                               tstsls_legend_none = T,
+                               pct_size = 2.5,
+                               n_dodge = 2))
+wrap_plots(map(graphs_matrix, 1), nrow = 2)
+# graphs_matrix[[1]][[2]] + (wrap_plots(map(graphs_matrix, 3), nrow = 2, guides = "collect") & theme(legend.position = 'top')) + plot_layout(widths = c(.3, .7))
+ggsave(paste0(figure_path, "baseline_matrix_comp_graphs_div_num_adults.pdf"),
+       height = fig_height*1.5, width = fig_width)
+# ----
+```
+
+### Parent attenuation bias - Baseline children income
+
+#### Setup
+
+```{r}
+# parameters
+parent_inc = "labor income"
+age_centered = 40
+parent_age_min = 30
+parent_age_max = 50
+parent_inc_var = paste0("mean_", str_replace_all(parent_inc, " ", "_"), "_real_", parent_age_min, parent_age_max)
+parent_inc_pred_def = "sum"
+n_parent_inc_obs = 1
+
+child_inc = "family total income"
+child_age_min = 30
+child_age_max = 50
+child_inc_var = paste0("mean_", str_replace_all(child_inc, " ", "_"), "_real_", child_age_min, child_age_max)
+```
+
+#### First-stage estimation
+
+```{r}
+# obtain list of age ages from 30 to 50 centered around 40
+generate_list_of_vectors <- function(center_value) {
+  vectors_list <- lapply(0:(parent_age_max-age_centered), function(i) {
+    if (i == 0) {
+      return(center_value)
+    } else {
+      return(list(((center_value - i):(center_value + i))[-which((center_value - i):(center_value + i) == center_value)], (center_value - i):(center_value + i)))
+    }
+  })
+  return(unlist(vectors_list, recursive = F))
+}
+age_range <- generate_list_of_vectors(age_centered)
+print(age_range)
+
+# obtain all combinations of instruments and age ranges
+attenuation_params <- crossing(instru = instru[4], age_range)
+
+# estimate first-stage ----
+# first-stage
+set.seed(1234)
+fs_predict <- map2(.x = attenuation_params$instru,
+                   .y = attenuation_params$age_range,
+                   ~ tstsls_fct(dt = parents_sample_clean %>%
+                                  left_join(inc_fct(dt = parents_sample_long,
+                                                    inc_var = parent_inc,
+                                                    age_range = .y,
+                                                    zero_to_na = replace_zero_incomes) %>% 
+                                              mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .)))),
+                                dt_child = child_sample_clean %>%
+                                  filter(core_sample == T) |> 
+                                  left_join(inc_fct(dt = child_sample_long,
+                                                    inc_var = child_inc,
+                                                    age_range = child_age_min:child_age_max,
+                                                    zero_to_na = replace_zero_incomes)),
+                                instruments = .x,
+                                constant_instruments = NULL,
+                                parent_inc_var = paste0("mean_", str_replace_all(parent_inc, " ", "_"), "_real_", min(.y), max(.y)),
+                                replace_0_income = NULL,
+                                fs_log_inc = T,
+                                parent_inc_pred_def = parent_inc_pred_def,
+                                child_inc_var = child_inc_var,
+                                n_parent_inc_obs = length(.y)))
+# ----
+```
+
+
+#### IGE - All FS
+
+```{r}
+# IGE comparison graph ----
+coefs_ige <- 1:length(attenuation_params$instru) %>% 
+  map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(n_parent_inc = length(attenuation_params$age_range[[.x]])))
+coefs_ige <- bind_rows(coefs_ige)
+# ----
+```
+
+#### RRC - All FS
+
+```{r}
+# RRC comparison graph ----
+coefs_rrc <- 1:length(attenuation_params$instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(n_parent_inc = length(attenuation_params$age_range[[.x]])))
+coefs_rrc <- bind_rows(coefs_rrc)
+# ----
+```
+
+#### Matrix - All FS
+
+```{r}
+# transition matrix comparison graph ----
+coefs_matrix <- 1:length(attenuation_params$instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               keep_data = T) |> 
+        mutate(n_parent_inc = length(attenuation_params$age_range[[.x]])))
+coefs_matrix <- bind_rows(coefs_matrix)
+# ----
+```
+
+#### All together
+
+```{r}
+# Bsaeline IGE Parent Attenuation bias - actual number of observations ----
+ige_parentattenuation_actualnobs_graph <- coefs_ige |> 
+  mutate(parent_inc_var_lab = case_when(parent_inc_var == "parent_inc" ~ "Observed (OLS)",
+                                        parent_inc_var == "parent_inc_predict" ~ "Predicted (TSTSLS)")) |> 
+  ggplot(aes(x = n_parent_inc,
+             y = ige,
+             linetype = parent_inc_var_lab)) +
+  geom_ribbon(aes(ymin = ige - 1.96*se_ige,
+                  ymax = ige + 1.96*se_ige), alpha = .2, show.legend = F, colour = NA) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .56), breaks = seq(0,.56,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,21), breaks = seq(1,21,2)) +
+  labs(x = NULL,
+       y = NULL,
+       linetype = "Parent income:",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "none",
+        legend.title = element_text(size = 12, face = "italic"),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_parentattenuation_actualnobs_graph
+# ----
+
+# RRC Parent Attenuation bias - actual number of observations ----
+rrc_parentattenuation_actualnobs_graph <- coefs_rrc |> 
+  mutate(parent_inc_var_lab = case_when(parent_inc_var == "rank_parent" ~ "Observed (OLS)",
+                                        parent_inc_var == "rank_parent_predict" ~ "Predicted (TSTSLS)")) |> 
+  ggplot(aes(x = n_parent_inc,
+             y = rrc,
+             linetype = parent_inc_var_lab)) +
+  geom_ribbon(aes(ymin = rrc - 1.96*se_rrc,
+                  ymax = rrc + 1.96*se_rrc), alpha = .2, show.legend = F, colour = NA) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .56), breaks = seq(0,.56,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,21), breaks = seq(1,21,2)) +
+  labs(x = "Number of parent\nincome observations (centered at 40)",
+       y = NULL,
+       linetype = "Parent income:",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        axis.title.x = element_text(size = 13),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic")) +
+  guides(linetype = guide_legend(nrow = 2))
+rrc_parentattenuation_actualnobs_graph
+# ----
+
+# P(5,5) and P(1,5) Parent Attenuation bias - actual number of observations ----
+coefs_matrix <- coefs_matrix |> 
+  filter(rank_parent_quintile %in% c("Bottom 20%", "Top 20%") & rank_child_quintile %in% c("Bottom 20%", "Top 20%")) |> 
+  mutate(parent_inc_var_lab = case_when(method == "ols" ~ "Observed (OLS)",
+                                        method == "tstsls" ~ "Predicted (TSTSLS)"),
+         group = case_when(rank_parent_quintile == "Bottom 20%" & rank_child_quintile == "Bottom 20%" ~ "Bot. 20% to Bot. 20%",
+                           rank_parent_quintile == "Bottom 20%" & rank_child_quintile == "Top 20%" ~ "Bot. 20% to Top 20%",
+                           rank_parent_quintile == "Top 20%" & rank_child_quintile == "Bottom 20%" ~ "Top 20% to Bot. 20%",
+                           rank_parent_quintile == "Top 20%" & rank_child_quintile == "Top 20%" ~ "Top 20% to Top 20%"),
+         group = factor(group, levels = c("Bot. 20% to Bot. 20%", "Bot. 20% to Top 20%", "Top 20% to Bot. 20%", "Top 20% to Top 20%")))
+
+dt_text <- coefs_matrix %>%
+  filter(n_parent_inc == 1 & parent_inc_var_lab == "Observed (OLS)") |> setDT()
+
+matrix_parentattenuation_actualnobs_graph <- coefs_matrix |> 
+  ggplot(aes(x = n_parent_inc,
+             y = pct,
+             col = group,
+             linetype = parent_inc_var_lab)) +
+  geom_point(alpha = alpha, show.legend = F) +
+  geom_line() +
+  geom_text(data = dt_text[group == "Bot. 20% to Bot. 20%"], aes(y = pct, label = group), hjust = 0, nudge_y = .09) +
+  geom_text(data = dt_text[group == "Bot. 20% to Top 20%"], aes(y = pct, label = group), hjust = 0, nudge_y = -.03) +
+  geom_text(data = dt_text[group == "Top 20% to Bot. 20%"], aes(y = pct, label = group), hjust = 0, nudge_y = .04) +
+  geom_text(data = dt_text[group == "Top 20% to Top 20%"], aes(y = pct, label = group), hjust = 0, nudge_y = -.07) +
+  scale_y_continuous(lim = c(0,.5), labels = scales::percent_format(1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,21), breaks = seq(1,21,2)) +
+  scale_colour_manual(values = alpha(my_palette[c(1,2,4,5)], alpha)) +
+  scale_fill_manual(values = alpha(my_palette[c(1,2,4,5)], .2)) +
+  labs(x = NULL,
+       y = NULL,
+       linetype = "Parent income:",
+       title = "Transition Matrix") +
+  theme(legend.position = "none",
+        legend.title = element_text(size = 12, face = "italic"),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic")) +
+  guides(col = FALSE)
+matrix_parentattenuation_actualnobs_graph
+# ----
+
+# All together Parent Attenuation bias - actual number of observations ----
+patchwork <- ige_parentattenuation_actualnobs_graph + rrc_parentattenuation_actualnobs_graph + matrix_parentattenuation_actualnobs_graph
+patchwork + plot_annotation(tag_levels = "A")
+ggsave(paste0(figure_path, "all_parentattenuation_actualnobs.pdf"), height = fig_height, width = fig_width)
+# ----
+```
+
+
+### Parent attenuation bias - 37-43 child age
+
+#### Setup
+
+```{r}
+# parameters
+parent_inc = "labor income"
+age_centered = 40
+parent_age_min = 30
+parent_age_max = 50
+parent_inc_var = paste0("mean_", str_replace_all(parent_inc, " ", "_"), "_real_", parent_age_min, parent_age_max)
+parent_inc_pred_def = "sum"
+n_parent_inc_obs = 1
+
+child_inc = "family total income"
+child_age_min = 37
+child_age_max = 43
+child_inc_var = paste0("mean_", str_replace_all(child_inc, " ", "_"), "_real_", child_age_min, child_age_max)
+```
+
+#### First-stage estimation
+
+```{r}
+# obtain list of age ages from 30 to 50 centered around 40
+generate_list_of_vectors <- function(center_value) {
+  vectors_list <- lapply(0:(parent_age_max-age_centered), function(i) {
+    if (i == 0) {
+      return(center_value)
+    } else {
+      return(list(((center_value - i):(center_value + i))[-which((center_value - i):(center_value + i) == center_value)], (center_value - i):(center_value + i)))
+    }
+  })
+  return(unlist(vectors_list, recursive = F))
+}
+age_range <- generate_list_of_vectors(age_centered)
+print(age_range)
+
+# obtain all combinations of instruments and age ranges
+attenuation_params <- crossing(instru = instru[4], age_range)
+
+# estimate first-stage ----
+# first-stage
+set.seed(1234)
+fs_predict <- map2(.x = attenuation_params$instru,
+                   .y = attenuation_params$age_range,
+                   ~ tstsls_fct(dt = parents_sample_clean %>%
+                                  left_join(inc_fct(dt = parents_sample_long,
+                                                    inc_var = parent_inc,
+                                                    age_range = .y,
+                                                    zero_to_na = replace_zero_incomes) %>% 
+                                              mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .)))),
+                                dt_child = child_sample_clean %>%
+                                  filter(core_sample == T) |> 
+                                  left_join(inc_fct(dt = child_sample_long,
+                                                    inc_var = child_inc,
+                                                    age_range = child_age_min:child_age_max,
+                                                    zero_to_na = replace_zero_incomes)),
+                                instruments = .x,
+                                constant_instruments = NULL,
+                                parent_inc_var = paste0("mean_", str_replace_all(parent_inc, " ", "_"), "_real_", min(.y), max(.y)),
+                                replace_0_income = NULL,
+                                fs_log_inc = T,
+                                parent_inc_pred_def = parent_inc_pred_def,
+                                child_inc_var = child_inc_var,
+                                n_parent_inc_obs = length(.y)))
+# ----
+```
+
+
+#### IGE - All FS
+
+```{r}
+# IGE comparison graph ----
+coefs_ige <- 1:length(attenuation_params$instru) %>% 
+  map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(n_parent_inc = length(attenuation_params$age_range[[.x]])))
+coefs_ige <- bind_rows(coefs_ige)
+# ----
+```
+
+#### RRC - All FS
+
+```{r}
+# RRC comparison graph ----
+coefs_rrc <- 1:length(attenuation_params$instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(n_parent_inc = length(attenuation_params$age_range[[.x]])))
+coefs_rrc <- bind_rows(coefs_rrc)
+# ----
+```
+
+#### Matrix - All FS
+
+```{r}
+# transition matrix comparison graph ----
+coefs_matrix <- 1:length(attenuation_params$instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               keep_data = T) |> 
+        mutate(n_parent_inc = length(attenuation_params$age_range[[.x]])))
+coefs_matrix <- bind_rows(coefs_matrix)
+# ----
+```
+
+#### All together
+
+```{r}
+# Bsaeline IGE Parent Attenuation bias - actual number of observations ----
+ige_parentattenuation_actualnobs_graph <- coefs_ige |> 
+  mutate(parent_inc_var_lab = case_when(parent_inc_var == "parent_inc" ~ "Observed (OLS)",
+                                        parent_inc_var == "parent_inc_predict" ~ "Predicted (TSTSLS)")) |> 
+  ggplot(aes(x = n_parent_inc,
+             y = ige,
+             linetype = parent_inc_var_lab)) +
+  geom_ribbon(aes(ymin = ige - 1.96*se_ige,
+                  ymax = ige + 1.96*se_ige), alpha = .2, show.legend = F, colour = NA) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .6), breaks = seq(0,.6,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,21), breaks = seq(1,21,2)) +
+  labs(x = NULL,
+       y = NULL,
+       linetype = "Parent income:",
+       title = "Intergenerational Elasticity") +
+  theme(legend.position = "none",
+        legend.title = element_text(size = 12, face = "italic"),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic"))
+ige_parentattenuation_actualnobs_graph
+# ----
+
+# RRC Parent Attenuation bias - actual number of observations ----
+rrc_parentattenuation_actualnobs_graph <- coefs_rrc |> 
+  mutate(parent_inc_var_lab = case_when(parent_inc_var == "rank_parent" ~ "Observed (OLS)",
+                                        parent_inc_var == "rank_parent_predict" ~ "Predicted (TSTSLS)")) |> 
+  ggplot(aes(x = n_parent_inc,
+             y = rrc,
+             linetype = parent_inc_var_lab)) +
+  geom_ribbon(aes(ymin = rrc - 1.96*se_rrc,
+                  ymax = rrc + 1.96*se_rrc), alpha = .2, show.legend = F, colour = NA) +
+  geom_point(color = my_palette[3], alpha = alpha) +
+  geom_line(color = my_palette[3]) +
+  scale_y_continuous(lim = c(0, .6), breaks = seq(0,.6,.1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,21), breaks = seq(1,21,2)) +
+  labs(x = "Number of parent\nincome observations (centered at 40)",
+       y = NULL,
+       linetype = "Parent income:",
+       title = "Rank-Rank Correlation") +
+  theme(legend.position = "top",
+        legend.title = element_text(size = 12, face = "italic"),
+        axis.title.x = element_text(size = 13),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic")) +
+  guides(linetype = guide_legend(nrow = 2))
+rrc_parentattenuation_actualnobs_graph
+# ----
+
+# P(5,5) and P(1,5) Parent Attenuation bias - actual number of observations ----
+coefs_matrix <- coefs_matrix |> 
+  filter(rank_parent_quintile %in% c("Bottom 20%", "Top 20%") & rank_child_quintile %in% c("Bottom 20%", "Top 20%")) |> 
+  mutate(parent_inc_var_lab = case_when(method == "ols" ~ "Observed (OLS)",
+                                        method == "tstsls" ~ "Predicted (TSTSLS)"),
+         group = case_when(rank_parent_quintile == "Bottom 20%" & rank_child_quintile == "Bottom 20%" ~ "Bot. 20% to Bot. 20%",
+                           rank_parent_quintile == "Bottom 20%" & rank_child_quintile == "Top 20%" ~ "Bot. 20% to Top 20%",
+                           rank_parent_quintile == "Top 20%" & rank_child_quintile == "Bottom 20%" ~ "Top 20% to Bot. 20%",
+                           rank_parent_quintile == "Top 20%" & rank_child_quintile == "Top 20%" ~ "Top 20% to Top 20%"),
+         group = factor(group, levels = c("Bot. 20% to Bot. 20%", "Bot. 20% to Top 20%", "Top 20% to Bot. 20%", "Top 20% to Top 20%")))
+
+dt_text <- coefs_matrix %>%
+  filter(n_parent_inc == 1 & parent_inc_var_lab == "Observed (OLS)") |> setDT()
+
+matrix_parentattenuation_actualnobs_graph <- coefs_matrix |> 
+  ggplot(aes(x = n_parent_inc,
+             y = pct,
+             col = group,
+             linetype = parent_inc_var_lab)) +
+  geom_point(alpha = alpha, show.legend = F) +
+  geom_line() +
+  geom_text(data = dt_text[group == "Bot. 20% to Bot. 20%"], aes(y = pct, label = group), hjust = 0, nudge_y = .09) +
+  geom_text(data = dt_text[group == "Bot. 20% to Top 20%"], aes(y = pct, label = group), hjust = 0, nudge_y = -.03) +
+  geom_text(data = dt_text[group == "Top 20% to Bot. 20%"], aes(y = pct, label = group), hjust = 0, nudge_y = .04) +
+  geom_text(data = dt_text[group == "Top 20% to Top 20%"], aes(y = pct, label = group), hjust = 0, nudge_y = -.07) +
+  scale_y_continuous(lim = c(0,.5), labels = scales::percent_format(1), expand = c(0,0)) +
+  scale_x_continuous(lim = c(1,21), breaks = seq(1,21,2)) +
+  scale_colour_manual(values = alpha(my_palette[c(1,2,4,5)], alpha)) +
+  scale_fill_manual(values = alpha(my_palette[c(1,2,4,5)], .2)) +
+  labs(x = NULL,
+       y = NULL,
+       linetype = "Parent income:",
+       title = "Transition Matrix") +
+  theme(legend.position = "none",
+        legend.title = element_text(size = 12, face = "italic"),
+        text=element_text(size = 16),
+        plot.title = element_text(size = 14, face = "italic")) +
+  guides(col = FALSE)
+matrix_parentattenuation_actualnobs_graph
+# ----
+
+# All together Parent Attenuation bias - actual number of observations ----
+patchwork <- ige_parentattenuation_actualnobs_graph + rrc_parentattenuation_actualnobs_graph + matrix_parentattenuation_actualnobs_graph
+patchwork + plot_annotation(tag_levels = "A")
+ggsave(paste0(figure_path, "all_parentattenuation_actualnobs_child_3743.pdf"), height = fig_height, width = fig_width)
+# ----
+```
+
+### Incomes over 35-45
+
+```{r}
+# drop income variables
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+parents_sample_clean <- parents_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+
+# parameters
+parent_age_min = 35
+parent_age_max = 45
+parent_inc_var = paste0("mean_", str_replace_all(parent_inc, " ", "_"), "_real_", parent_age_min, parent_age_max)
+
+child_age_min = 35
+child_age_max = 45
+child_inc_var = paste0("mean_", str_replace_all(child_inc, " ", "_"), "_real_", child_age_min, child_age_max)
+
+replace_zero_incomes = F
+
+# estimate first-stage ####
+# parent sample - obtain incomes
+parents_sample_clean <- parents_sample_clean %>%
+  left_join(inc_fct(dt = parents_sample_long,
+                    inc_var = parent_inc,
+                    age_range = parent_age_min:parent_age_max,
+                    zero_to_na = replace_zero_incomes) %>% 
+              mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .))))
+# child sample - obtain incomes
+child_sample_clean <- child_sample_clean %>%
+  filter(core_sample == T) |> 
+  left_join(inc_fct(dt = child_sample_long,
+                    inc_var = child_inc,
+                    age_range = child_age_min:child_age_max,
+                    zero_to_na = replace_zero_incomes))
+
+# first-stage
+set.seed(1234)
+fs_predict <- 1:length(instru) %>% 
+  map(~ tstsls_fct(dt = parents_sample_clean,
+                   dt_child = child_sample_clean,
+                   instruments = instru[[.x]],
+                   constant_instruments = NULL,
+                   parent_inc_var = parent_inc_var,
+                   replace_0_income = NULL,
+                   fs_log_inc = T,
+                   parent_inc_pred_def = parent_inc_pred_def,
+                   child_inc_var = child_inc_var,
+                   n_parent_inc_obs = n_parent_inc_obs))
+# ----
+
+# IGE comparison graph ----
+coefs_ige <- 1:length(instru) %>% 
+  map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_ige, here("data/figures_raw_data/coefs_ige_3545.csv"))
+# ----
+
+# RRC comparison graph ----
+coefs_rrc <- 1:length(instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_rrc, here("data/figures_raw_data/coefs_rrc_3545.csv"))
+# ----
+
+# transition matrix comparison graph ----
+full_instru_labs_new <- c("education", "occupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+coefs_matrix <- 1:length(instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_matrix, here("data/figures_raw_data/coefs_matrix_3545.csv"))
+# ----
+
+# geographic-level ----
+instru_reg = rep(1:length(instru), length(regions))
+regions_reg <- rep(regions, each = length(instru))
+
+full_instru_labs_new <- c("education", "\noccupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+coefs_regions <- map2(.x = instru_reg,
+                      .y = regions_reg,
+                      ~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]] |> filter(region == .y),
+                                             keep_data = T) |> 
+                        mutate(instru = .x,
+                               region = .y)) |> 
+  bind_rows()
+fwrite(coefs_regions, here("data/figures_raw_data/coefs_region_3545.csv"))
+# ----
+```
+
+### Only SRC Sample
+
+```{r}
+# drop income variables
+child_sample_clean <- child_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+parents_sample_clean <- parents_sample_clean %>% 
+  select(-contains(c("income", "mean_age")))
+
+# parameters
+parent_age_min = 30
+parent_age_max = 50
+parent_inc_var = paste0("mean_", str_replace_all(parent_inc, " ", "_"), "_real_", parent_age_min, parent_age_max)
+
+child_age_min = 30
+child_age_max = 50
+child_inc_var = paste0("mean_", str_replace_all(child_inc, " ", "_"), "_real_", child_age_min, child_age_max)
+
+replace_zero_incomes = F
+
+# estimate first-stage ####
+# parent sample - obtain incomes
+parents_sample_clean <- parents_sample_clean %>%
+  filter(itw_num_cat == "Member of, or moved into, a family from the 1968 SRC cross-section sample") |> 
+  left_join(inc_fct(dt = parents_sample_long,
+                    inc_var = parent_inc,
+                    age_range = parent_age_min:parent_age_max,
+                    zero_to_na = replace_zero_incomes) %>% 
+              mutate(across(starts_with("n_"), ~ ifelse(is.na(.), 0, .))))
+# child sample - obtain incomes
+child_sample_clean <- child_sample_clean %>%
+  filter(core_sample == T & itw_num_cat == "Member of, or moved into, a family from the 1968 SRC cross-section sample") |> 
+  left_join(inc_fct(dt = child_sample_long,
+                    inc_var = child_inc,
+                    age_range = child_age_min:child_age_max,
+                    zero_to_na = replace_zero_incomes))
+
+# first-stage
+set.seed(1234)
+fs_predict <- 1:length(instru) %>% 
+  map(~ tstsls_fct(dt = parents_sample_clean,
+                   dt_child = child_sample_clean,
+                   instruments = instru[[.x]],
+                   constant_instruments = NULL,
+                   parent_inc_var = parent_inc_var,
+                   replace_0_income = NULL,
+                   fs_log_inc = T,
+                   parent_inc_pred_def = parent_inc_pred_def,
+                   child_inc_var = child_inc_var,
+                   n_parent_inc_obs = n_parent_inc_obs))
+# ----
+
+# IGE comparison graph ----
+coefs_ige <- 1:length(instru) %>% 
+  map(~ ige_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_ige, here("data/figures_raw_data/coefs_ige_src.csv"))
+# ----
+
+# RRC comparison graph ----
+coefs_rrc <- 1:length(instru) %>% 
+  map(~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]],
+                             keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_rrc, here("data/figures_raw_data/coefs_rrc_src.csv"))
+# ----
+
+# transition matrix comparison graph ----
+full_instru_labs_new <- c("education", "occupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+coefs_matrix <- 1:length(instru) %>% 
+  map(~ matrix_predicted_graph(dt = fs_predict[[.x]][[1]],
+                               keep_data = T) |> 
+        mutate(instru = instru_labs[[.x]])) |> 
+  bind_rows()
+fwrite(coefs_matrix, here("data/figures_raw_data/coefs_matrix_src.csv"))
+# ----
+
+# geographic-level ----
+instru_reg = rep(1:length(instru), length(regions))
+regions_reg <- rep(regions, each = length(instru))
+
+full_instru_labs_new <- c("education", "\noccupation (3-digit)", "race", "\nbirth cohort", "state FE")
+instru_labs_new = list(full_instru_labs_new[1],
+                       paste0(full_instru_labs_new[1:2], collapse = " + "),
+                       paste0(full_instru_labs_new[1:4], collapse = " + "),
+                       paste0(full_instru_labs_new[1:5], collapse = " + "))
+coefs_rrc <- map2(.x = instru_reg,
+                   .y = regions_reg,
+                   ~ rrc_comparison_graph(dt = fs_predict[[.x]][[1]] |> filter(region == .y),
+                                          keep_data = T) |> 
+                     mutate(instru = .x,
+                            region = .y)) |> 
+  bind_rows()
+fwrite(coefs_rrc, here("data/figures_raw_data/coefs_rrc_region_src.csv"))
+# ----
+```
+
+### Compare baseline with SRC sample, family longitudinal, individual longitudinal and individual cross sectional weights (measured in last income obs year)
+
+```{r}
+instru_set <- "education + occupation (3-digit) + race + \nbirth cohort + state FE"
+
+weights_used = c("family_long_weights", "ind_long_weights", "ind_cross_sec_weights")
+estimates <- c("ige", "rrc")
+
+for (i in estimates) {
+  assign(paste0("baseline_", i), fread(here(paste0("data/figures_raw_data/baseline_", i, "_coefs.csv"))))
+  assign(paste0("src_", i), fread(here(paste0("data/figures_raw_data/coefs_", i, "_src.csv"))))
+  for (j in weights_used) {
+    assign(paste0(j, "_", i), fread(here(paste0("data/figures_raw_data/coefs_", i, "_", j, ".csv"))))
+  }
+}
+
+extract_coefs_ige_fct <- function(dt, spec_name, value_var_name) {
+  dt |>
+    filter(instru == instru_set) |>
+    mutate(spec = spec_name,
+           pct_diff = (lag(ige) - ige)/ige*100) |> 
+    select(parent_inc_var, ige, se_ige, pct_diff, n_obs) |> 
+    pivot_longer(cols = -parent_inc_var,
+                 names_to = "stat") |> 
+    filter(!is.na(value)) |> 
+    select(!!value_var_name := value)
+}
+
+comp_ige <- bind_cols(
+  baseline_ige |>
+    filter(instru == instru_set) |>
+    mutate(spec = "baseline",
+           pct_diff = (lag(ige) - ige)/ige*100) |> 
+    select(parent_inc_var, ige, se_ige, pct_diff, n_obs) |> 
+    pivot_longer(cols = -parent_inc_var,
+                 names_to = "stat") |>
+    filter(!is.na(value)) |> 
+    rename(baseline = value),
+  extract_coefs_ige_fct(src_ige, "SRC sample", "src_sample"),
+  extract_coefs_ige_fct(get(paste0(weights_used[1], "_ige")), weights_used[1], weights_used[1]),
+  extract_coefs_ige_fct(get(paste0(weights_used[2], "_ige")), weights_used[2], weights_used[2]),
+  extract_coefs_ige_fct(get(paste0(weights_used[3], "_ige")), weights_used[3], weights_used[3]))
+setDT(comp_ige)
+comp_ige <- comp_ige[-3,]
+
+
+extract_coefs_rrc_fct <- function(dt, spec_name, value_var_name) {
+  dt |>
+    filter(instru == instru_set) |>
+    mutate(spec = spec_name,
+           pct_diff = (lag(rrc) - rrc)/rrc*100) |> 
+    select(parent_inc_var, rrc, se_rrc, pct_diff, n_obs) |> 
+    pivot_longer(cols = -parent_inc_var,
+                 names_to = "stat") |> 
+    filter(!is.na(value)) |> 
+    select(!!value_var_name := value)
+}
+
+comp_rrc <- bind_cols(
+  baseline_rrc |>
+    filter(instru == instru_set) |>
+    mutate(spec = "baseline",
+           pct_diff = (lag(rrc) - rrc)/rrc*100) |> 
+    select(parent_inc_var, rrc, se_rrc, pct_diff, n_obs) |> 
+    pivot_longer(cols = -parent_inc_var,
+                 names_to = "stat") |> 
+    filter(!is.na(value)) |> 
+    rename(baseline = value),
+  extract_coefs_rrc_fct(src_rrc, "SRC sample", "src_sample"),
+  extract_coefs_rrc_fct(get(paste0(weights_used[1], "_rrc")), weights_used[1], weights_used[1]),
+  extract_coefs_rrc_fct(get(paste0(weights_used[2], "_rrc")), weights_used[2], weights_used[2]),
+  extract_coefs_rrc_fct(get(paste0(weights_used[3], "_rrc")), weights_used[3], weights_used[3]))
+setDT(comp_rrc)
+comp_rrc <- comp_rrc[-3,]
+
+
+
+baseline_regions <- fread(here("data/figures_raw_data/baseline_coefs_rrc_region.csv"))
+src_regions <- fread(here("data/figures_raw_data/coefs_rrc_region_src.csv"))
+for (i in weights_used) {
+    assign(paste0(i, "_regions"), fread(here(paste0("data/figures_raw_data/coefs_rrc_region_", i, ".csv"))))
+}
+
+extract_coefs_region_fct <- function(dt, spec_name, value_var_name) {
+  dt |>
+    filter(instru == 4) |>
+    mutate(spec = spec_name) |>
+    group_by(region) |> 
+    mutate(pct_diff = (lag(rrc) - rrc)/rrc*100,
+           pct_diff_aum = (lag(aum) - aum)/aum*100) |> 
+    ungroup() |> 
+    select(region, parent_inc_var, rrc, se_rrc, pct_diff, aum, pct_diff_aum, n_obs) |> 
+    pivot_longer(cols = -c(region, parent_inc_var),
+                 names_to = "stat") |>
+    filter(!is.na(value)) |> 
+    mutate(order = case_when(stat == "rrc" ~ 1,
+                             stat == "se_rrc" ~ 2,
+                             stat == "aum" ~ 3,
+                             stat == "pct_diff" ~ 4,
+                             stat == "pct_diff_aum" ~ 5,
+                             stat == "n_obs" ~ 6)) |> 
+    arrange(region, parent_inc_var, order) |>
+    select(!!value_var_name := value)
+}
+
+comp_regions <- bind_cols(
+  baseline_regions |>
+    filter(instru == 4) |>
+    mutate(spec = "baseline") |> 
+    group_by(region) |> 
+    mutate(pct_diff = (lag(rrc) - rrc)/rrc*100,
+           pct_diff_aum = (lag(aum) - aum)/aum*100) |> 
+    ungroup() |> 
+    select(region, parent_inc_var, rrc, se_rrc, pct_diff, aum, pct_diff_aum, n_obs) |> 
+    pivot_longer(cols = -c(region, parent_inc_var),
+                 names_to = "stat") |>
+    filter(!is.na(value)) |> 
+    mutate(order = case_when(stat == "rrc" ~ 1,
+                             stat == "se_rrc" ~ 2,
+                             stat == "aum" ~ 3,
+                             stat == "pct_diff" ~ 4,
+                             stat == "pct_diff_aum" ~ 5,
+                             stat == "n_obs" ~ 6)) |> 
+    arrange(region, parent_inc_var, order) |> 
+    rename(baseline = value) |> select(region, parent_inc_var, stat, baseline),
+  extract_coefs_region_fct(src_regions, "SRC sample", "src_sample"),
+  extract_coefs_region_fct(get(paste0(weights_used[1], "_regions")), weights_used[1], weights_used[1]),
+  extract_coefs_region_fct(get(paste0(weights_used[2], "_regions")), weights_used[2], weights_used[2]),
+  extract_coefs_region_fct(get(paste0(weights_used[3], "_regions")), weights_used[3], weights_used[3]))
+setDT(comp_regions)
+comp_regions
+comp_regions <- comp_regions[-c(4, 14, 24, 34)]
+
+comp_all <- bind_rows(comp_ige, comp_rrc, comp_regions) |> 
+  select(parent_inc_var, region, stat, baseline, src_sample, all_of(weights_used))
+comp_all <- comp_all |> 
+  mutate(parent_inc_var_lab = case_when(str_detect(parent_inc_var, "_predict") & stat %in% c("ige", "rrc") & is.na(region) ~ "Predicted parent income (TSTSLS)",
+                                        !str_detect(parent_inc_var, "_predict") & stat %in% c("ige", "rrc") & is.na(region) ~ "Observed parent income (OLS)",
+                                        stat == "rrc" & !is.na(region) & !str_detect(parent_inc_var, "_predict")  ~ "RRC - OLS",
+                                        stat == "rrc" & !is.na(region) & str_detect(parent_inc_var, "_predict")  ~ "RRC - TSTSLS",
+                                        stat == "aum" & !is.na(region)  & !str_detect(parent_inc_var, "_predict") ~ "AUM - OLS",
+                                        stat == "aum" & !is.na(region)  & str_detect(parent_inc_var, "_predict") ~ "AUM - TSTSLS",
+                                        stat == "n_obs" ~ "Number of observations",
+                                        stat == "pct_diff" & is.na(region) ~ "Percentage diff. TSTSLS vs OLS",
+                                        stat == "pct_diff" & !is.na(region) ~ "RRC percentage diff. TSTSLS vs OLS",
+                                        stat == "pct_diff_aum" ~ "AUM percentage diff. TSTSLS vs OLS",
+                                        TRUE ~ ""),
+         across(c("baseline", "src_sample", all_of(weights_used)), ~ case_when(stat %in% c("ige", "rrc") ~ as.character(round(., 3)),
+                                                                                                  stat == "aum" ~ as.character(round(., 2)),
+                                                                                                  str_detect(stat, "pct_diff") ~ paste0(round(., 2), "%"),
+                                                                                                  stat == "n_obs"~ formatC(., big.mark = ",", format = "d"),
+                                                                                                  str_detect(stat, "se_") ~ paste0("(", round(., 3), ")"))))
+
+comp_all_clean <- comp_all |>
+  select(parent_inc_var_lab, baseline, src_sample, all_of(weights_used))
+
+n_columns <- ncol(comp_all_clean) - 1
+kbl(comp_all_clean, "latex",
+    booktabs = T,
+    caption = "Comparison between Baseline Results and Weighted Results",
+    label = "baseline_vs_weights",
+    linesep = "\\smallskip",
+    col.names = c("", paste0("(", 1:n_columns,")")),
+    escape = TRUE,
+    align = c("l", rep("c", n_columns))) %>%
+  kable_styling(position = "center", latex_options = c("scale_down")) %>% 
+  footnote(general_title = "Notes:", general = "", threeparttable = TRUE, footnote_as_chunk = T) %>%
+  add_header_above(c("",
+                     "\\\\thead{Baseline\\\\\\\\Estimates}" = 1,
+                     "\\\\thead{Only SRC\\\\\\\\Sample}" = 1,
+                     "\\\\thead{Family\\\\\\\\Longitudinal}" = 1,
+                     "\\\\thead{Individual\\\\\\\\Longitudinal}" = 1,
+                     "\\\\thead{Individual\\\\\\\\Cross-Sectional}" = 1), line = F, escape = FALSE) %>% 
+  add_header_above(c(rep("", 3),
+                     "Weights in Last Child Income Observation Year" = 3), line = T, italic = T) |> 
+  pack_rows("Panel A. National - Intergenerational Elasticity (IGE)", 1, 6, bold = F, italic = T) %>%
+  pack_rows("Panel B. National - Rank-Rank Correlation (RRC)", 7, 12, bold = F, italic = T) %>%
+  pack_rows("Panel C. Region: Midwest", 13, 21, bold = F, italic = T) |>
+  pack_rows("Panel D. Region: Northeast", 22, 30, bold = F, italic = T) |> 
+  pack_rows("Panel E. Region: South", 31, 39, bold = F, italic = T) |> 
+  pack_rows("Panel F. Region: West", 40, 48, bold = F, italic = T) |>
+  save_kable(file = paste0(figure_path, "comp_baseline_weights.tex"))
+         
+```
+
+### Compare baseline with SRC sample, 35-45 income age ranges, dropping 0 income values, accounting for household size
+
+```{r}
+instru_set <- "education + occupation (3-digit) + race + \nbirth cohort + state FE"
+
+robust_spec = c("3545", "replace_zero_to_na", "div_num_adults")
+estimates <- c("ige", "rrc")
+
+for (i in estimates) {
+  assign(paste0("baseline_", i), fread(here(paste0("data/figures_raw_data/baseline_", i, "_coefs.csv"))))
+  assign(paste0("src_", i), fread(here(paste0("data/figures_raw_data/coefs_", i, "_src.csv"))))
+  for (j in robust_spec) {
+    assign(paste0(j, "_", i), fread(here(paste0("data/figures_raw_data/coefs_", i, "_", j, ".csv"))))
+  }
+}
+
+extract_coefs_ige_fct <- function(dt, spec_name, value_var_name) {
+  dt |>
+    filter(instru == instru_set) |>
+    mutate(spec = spec_name,
+           pct_diff = (lag(ige) - ige)/ige*100) |> 
+    select(parent_inc_var, ige, se_ige, pct_diff, n_obs) |> 
+    pivot_longer(cols = -parent_inc_var,
+                 names_to = "stat") |> 
+    filter(!is.na(value)) |> 
+    select(!!value_var_name := value)
+}
+
+comp_ige <- bind_cols(
+  baseline_ige |>
+    filter(instru == instru_set) |>
+    mutate(spec = "baseline",
+           pct_diff = (lag(ige) - ige)/ige*100) |> 
+    select(parent_inc_var, ige, se_ige, pct_diff, n_obs) |> 
+    pivot_longer(cols = -parent_inc_var,
+                 names_to = "stat") |>
+    filter(!is.na(value)) |> 
+    rename(baseline = value),
+  extract_coefs_ige_fct(src_ige, "SRC sample", "src_sample"),
+  extract_coefs_ige_fct(get(paste0(robust_spec[1], "_ige")), robust_spec[1], robust_spec[1]),
+  extract_coefs_ige_fct(get(paste0(robust_spec[2], "_ige")), robust_spec[2], robust_spec[2]),
+  extract_coefs_ige_fct(get(paste0(robust_spec[3], "_ige")), robust_spec[3], robust_spec[3]))
+setDT(comp_ige)
+comp_ige <- comp_ige[-3,]
+
+
+extract_coefs_rrc_fct <- function(dt, spec_name, value_var_name) {
+  dt |>
+    filter(instru == instru_set) |>
+    mutate(spec = spec_name,
+           pct_diff = (lag(rrc) - rrc)/rrc*100) |> 
+    select(parent_inc_var, rrc, se_rrc, pct_diff, n_obs) |> 
+    pivot_longer(cols = -parent_inc_var,
+                 names_to = "stat") |> 
+    filter(!is.na(value)) |> 
+    select(!!value_var_name := value)
+}
+
+comp_rrc <- bind_cols(
+  baseline_rrc |>
+    filter(instru == instru_set) |>
+    mutate(spec = "baseline",
+           pct_diff = (lag(rrc) - rrc)/rrc*100) |> 
+    select(parent_inc_var, rrc, se_rrc, pct_diff, n_obs) |> 
+    pivot_longer(cols = -parent_inc_var,
+                 names_to = "stat") |> 
+    filter(!is.na(value)) |> 
+    rename(baseline = value),
+  extract_coefs_rrc_fct(src_rrc, "SRC sample", "src_sample"),
+  extract_coefs_rrc_fct(get(paste0(robust_spec[1], "_rrc")), robust_spec[1], robust_spec[1]),
+  extract_coefs_rrc_fct(get(paste0(robust_spec[2], "_rrc")), robust_spec[2], robust_spec[2]),
+  extract_coefs_rrc_fct(get(paste0(robust_spec[3], "_rrc")), robust_spec[3], robust_spec[3]))
+setDT(comp_rrc)
+comp_rrc <- comp_rrc[-3,]
+
+
+
+baseline_regions <- fread(here("data/figures_raw_data/baseline_coefs_rrc_region.csv"))
+src_regions <- fread(here("data/figures_raw_data/coefs_rrc_region_src.csv"))
+for (i in robust_spec) {
+    assign(paste0(i, "_regions"), fread(here(paste0("data/figures_raw_data/coefs_region_", i, ".csv"))))
+}
+
+extract_coefs_region_fct <- function(dt, spec_name, value_var_name) {
+  dt |>
+    filter(instru == 4) |>
+    mutate(spec = spec_name) |>
+    group_by(region) |> 
+    mutate(pct_diff = (lag(rrc) - rrc)/rrc*100,
+           pct_diff_aum = (lag(aum) - aum)/aum*100) |> 
+    ungroup() |> 
+    select(region, parent_inc_var, rrc, se_rrc, pct_diff, aum, pct_diff_aum, n_obs) |> 
+    pivot_longer(cols = -c(region, parent_inc_var),
+                 names_to = "stat") |>
+    filter(!is.na(value)) |> 
+    mutate(order = case_when(stat == "rrc" ~ 1,
+                             stat == "se_rrc" ~ 2,
+                             stat == "aum" ~ 3,
+                             stat == "pct_diff" ~ 4,
+                             stat == "pct_diff_aum" ~ 5,
+                             stat == "n_obs" ~ 6)) |> 
+    arrange(region, parent_inc_var, order) |>
+    select(!!value_var_name := value)
+}
+
+comp_regions <- bind_cols(
+  baseline_regions |>
+    filter(instru == 4) |>
+    mutate(spec = "baseline") |> 
+    group_by(region) |> 
+    mutate(pct_diff = (lag(rrc) - rrc)/rrc*100,
+           pct_diff_aum = (lag(aum) - aum)/aum*100) |> 
+    ungroup() |> 
+    select(region, parent_inc_var, rrc, se_rrc, pct_diff, aum, pct_diff_aum, n_obs) |> 
+    pivot_longer(cols = -c(region, parent_inc_var),
+                 names_to = "stat") |>
+    filter(!is.na(value)) |> 
+    mutate(order = case_when(stat == "rrc" ~ 1,
+                             stat == "se_rrc" ~ 2,
+                             stat == "aum" ~ 3,
+                             stat == "pct_diff" ~ 4,
+                             stat == "pct_diff_aum" ~ 5,
+                             stat == "n_obs" ~ 6)) |> 
+    arrange(region, parent_inc_var, order) |> 
+    rename(baseline = value) |> select(region, parent_inc_var, stat, baseline),
+  extract_coefs_region_fct(src_regions, "SRC sample", "src_sample"),
+  extract_coefs_region_fct(get(paste0(robust_spec[1], "_regions")), robust_spec[1], robust_spec[1]),
+  extract_coefs_region_fct(get(paste0(robust_spec[2], "_regions")), robust_spec[2], robust_spec[2]),
+  extract_coefs_region_fct(get(paste0(robust_spec[3], "_regions")), robust_spec[3], robust_spec[3]))
+setDT(comp_regions)
+comp_regions
+comp_regions <- comp_regions[-c(4, 14, 24, 34)]
+
+comp_all <- bind_rows(comp_ige, comp_rrc, comp_regions) |> 
+  select(parent_inc_var, region, stat, baseline, src_sample, all_of(robust_spec))
+comp_all <- comp_all |> 
+  mutate(parent_inc_var_lab = case_when(str_detect(parent_inc_var, "_predict") & stat %in% c("ige", "rrc") & is.na(region) ~ "Predicted parent income (TSTSLS)",
+                                        !str_detect(parent_inc_var, "_predict") & stat %in% c("ige", "rrc") & is.na(region) ~ "Observed parent income (OLS)",
+                                        stat == "rrc" & !is.na(region) & !str_detect(parent_inc_var, "_predict")  ~ "RRC - OLS",
+                                        stat == "rrc" & !is.na(region) & str_detect(parent_inc_var, "_predict")  ~ "RRC - TSTSLS",
+                                        stat == "aum" & !is.na(region)  & !str_detect(parent_inc_var, "_predict") ~ "AUM - OLS",
+                                        stat == "aum" & !is.na(region)  & str_detect(parent_inc_var, "_predict") ~ "AUM - TSTSLS",
+                                        stat == "n_obs" ~ "Number of observations",
+                                        stat == "pct_diff" & is.na(region) ~ "Percentage diff. TSTSLS vs OLS",
+                                        stat == "pct_diff" & !is.na(region) ~ "RRC percentage diff. TSTSLS vs OLS",
+                                        stat == "pct_diff_aum" ~ "AUM percentage diff. TSTSLS vs OLS",
+                                        TRUE ~ ""),
+         across(c("baseline", "src_sample", all_of(robust_spec)), ~ case_when(stat %in% c("ige", "rrc") ~ as.character(round(., 3)),
+                                                                                                  stat == "aum" ~ as.character(round(., 2)),
+                                                                                                  str_detect(stat, "pct_diff") ~ paste0(round(., 2), "%"),
+                                                                                                  stat == "n_obs"~ formatC(., big.mark = ",", format = "d"),
+                                                                                                  str_detect(stat, "se_") ~ paste0("(", round(., 3), ")"))))
+
+comp_all_clean <- comp_all |>
+  select(parent_inc_var_lab, baseline, src_sample, all_of(robust_spec))
+
+n_columns <- ncol(comp_all_clean) - 1
+kbl(comp_all_clean, "latex",
+    booktabs = T,
+    caption = "Robustness of Baseline Results",
+    label = "psid_robust",
+    linesep = "\\smallskip",
+    col.names = c("", paste0("(", 1:n_columns,")")),
+    escape = TRUE,
+    align = c("l", rep("c", n_columns))) %>%
+  kable_styling(position = "center", latex_options = c("scale_down")) %>% 
+  footnote(general_title = "Notes:", general = "", threeparttable = TRUE, footnote_as_chunk = T) %>%
+  add_header_above(c("",
+                     "\\\\thead{Baseline\\\\\\\\Estimates}" = 1,
+                     "\\\\thead{Only SRC\\\\\\\\Sample}" = 1,
+                     "\\\\thead{35-45 Income\\\\\\\\Age Range}" = 1,
+                     "\\\\thead{Dropping\\\\\\\\Zero Inc. Obs.}" = 1,
+                     "\\\\thead{Accounting\\\\\\\\Household Size}" = 1), line = F, escape = FALSE) %>%  
+  pack_rows("Panel A. National - Intergenerational Elasticity (IGE)", 1, 6, bold = F, italic = T) %>%
+  pack_rows("Panel B. National - Rank-Rank Correlation (RRC)", 7, 12, bold = F, italic = T) %>%
+  pack_rows("Panel C. Region: Midwest", 13, 21, bold = F, italic = T) |>
+  pack_rows("Panel D. Region: Northeast", 22, 30, bold = F, italic = T) |> 
+  pack_rows("Panel E. Region: South", 31, 39, bold = F, italic = T) |> 
+  pack_rows("Panel F. Region: West", 40, 48, bold = F, italic = T) |>
+  save_kable(file = paste0(figure_path, "comp_baseline_robustness.tex"))
+
+# for referee 3, only baseline and 35-45:
+comp_all_clean_ref3 <- comp_all_clean |> 
+  select(parent_inc_var_lab, baseline, `3545`)
+n_columns <- ncol(comp_all_clean_ref3) - 1
+kbl(comp_all_clean_ref3, "latex",
+    booktabs = T,
+    caption = "Robustness of Baseline Results",
+    label = "psid_robust",
+    linesep = "\\smallskip",
+    col.names = c("", paste0("(", 1:n_columns,")")),
+    escape = TRUE,
+    align = c("l", rep("c", n_columns))) %>%
+  kable_styling(position = "center", latex_options = c("scale_down")) %>% 
+  footnote(general_title = "Notes:", general = "", threeparttable = TRUE, footnote_as_chunk = T) %>%
+  add_header_above(c("",
+                     "\\\\thead{Baseline\\\\\\\\Estimates}" = 1,
+                     "\\\\thead{35-45 Income\\\\\\\\Age Range}" = 1), line = F, escape = FALSE) %>%  
+  pack_rows("Panel A. National - Intergenerational Elasticity (IGE)", 1, 6, bold = F, italic = T) %>%
+  pack_rows("Panel B. National - Rank-Rank Correlation (RRC)", 7, 12, bold = F, italic = T) %>%
+  pack_rows("Panel C. Region: Midwest", 13, 21, bold = F, italic = T) |>
+  pack_rows("Panel D. Region: Northeast", 22, 30, bold = F, italic = T) |> 
+  pack_rows("Panel E. Region: South", 31, 39, bold = F, italic = T) |> 
+  pack_rows("Panel F. Region: West", 40, 48, bold = F, italic = T) |>
+  save_kable(file = paste0(figure_path, "comp_baseline_3545_ref3.tex"))
+
+```
+
+
+## Session info
+
+```{r}
+sessionInfo()
+```

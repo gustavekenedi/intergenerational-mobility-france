@@ -1,0 +1,296 @@
+---
+title: "Income Dataset Creation"
+author: "Gustave Kenedi and Louis Sirugue"
+date: "`r Sys.time()`"
+format:
+  html:
+    toc: true
+    df-print: paged
+    embed-resources: true
+editor: visual
+editor_options: 
+  chunk_output_type: console
+execute:
+  warning: false
+---
+
+## Packages
+
+```{r}
+packages <- c("here","tidyverse", "data.table", "furrr", "readxl", "janitor", "ggthemr", "furrr", "broom", "tidylog")
+librarian::shelf(packages, quiet = TRUE)
+rm(packages)
+```
+
+## Functions
+
+```{r}
+source(here("code_lib/useful_functions.R"))
+```
+
+## Params
+
+```{r}
+# figures
+fig_height = 6
+fig_width = (16/9)*fig_height
+ggthemr("pale")
+
+theme_update(text = element_text(size = 14),
+             legend.title = element_text(face = "italic", size = 12),
+             legend.text = element_text(size = 12),
+             legend.background = element_rect(fill = alpha("white", .75)),
+             plot.caption = element_text(size = 8, face = "italic", color = "#7d7d7d"))
+
+# no scientific notation
+options(scipen=999)
+
+# path to data
+data_path <- "~/Dropbox/3resources/data/psid/"
+```
+
+## Load data
+
+```{r}
+#| cache: true
+#| output: false
+
+# PSID variables dictionary
+psid_vars <- read_excel(paste0(data_path, "fims/psid.xlsx")) %>%
+  clean_names() %>%
+  mutate(var_id = 1:n()) %>% 
+  pivot_longer(cols = -c(var_id, type, category, text, head_wife, var_count),
+               names_prefix = "y",
+               names_to = "year",
+               values_to = "variable")
+
+# individual file
+ind_2019 <- fread(paste0(data_path, "ind2019er/IND2019ER.csv"))
+ind_2019 <- ind_2019 %>% 
+  mutate(fam_id_68 = ER30001,
+         person_num_68 = ER30002,
+         ind_id_68 = fam_id_68*1000 + person_num_68,
+         gender = case_when(ER32000 == 1 ~ "Male",
+                            ER32000 == 2 ~ "Female"))
+setDT(ind_2019)
+
+# family files 1968-20219
+years <- c(1968:1997, seq(1999, 2019, 2))
+for (i in years) {
+  print(i)
+  
+  if (i %in% 1968:1993) {
+    file_path <- paste0(data_path, "fam", i, "/FAM", i)
+  } else {
+    file_path <- paste0(data_path, "fam", i, "er", "/FAM", i, "ER")
+  }
+  
+  assign(paste0("fam_", i), fread(paste0(file_path, ".csv")))
+}
+
+# CPI U (series ID: CUUR0000SA0)
+cpi_u <- read_excel(paste0(data_path, "cpi_u/cpi_u_1967_2021.xlsx"), skip = 11) %>% clean_names()
+
+gc()
+```
+
+## Income variables
+
+Define income variables as closely as to how they are defined in our paper:
+
+-   **reference person + partner**
+
+    -   *labor income:* "money income from labor"\
+        $\rightarrow$ more comprehensive than wage because it corresponds to the "sum of the actual amounts of labor part of farm income and business income, bonuses, overtime, commissions, professional practice, labor part of income from roomers and boarders or business income plus wages,"\
+        $\rightarrow$ note that wages are only available for reference persons and not for partners, therefore not usable for us. Probably not a major concern since labor income captures mostly wages anyways.\
+        $\rightarrow$ one difference with our paper is that this more comprehensive definition of labor incomes will include self-employment income.
+
+    -   *taxable income* + *total transfer income* (so we can compare labor-family income RRC with family income-family income RRC (and other intergenerational stats))\
+        $\rightarrow$ total transfer income: aid to dependent children + aid to dependent children with unemployed fathers + other welfare + social security + retirement + UI + alimony + help from relatives + income from other sources.\
+        $\rightarrow$ here again the definition is a bit more comprehensive because total transfer income includes transfers we exclude in our definition.\
+        $\rightarrow$ issue is that UI + retirement + alimony is generally available only for reference person and not consistently reported rendering the analysis a bit more complicated.
+
+-   **children**
+
+    -   *taxable income* + *total transfer income\
+        *$\rightarrow$ total transfer income: aid to dependent children + aid to dependent children with unemployed fathers + other welfare + social security + retirement + UI + alimony + help from relatives + income from other sources
+
+```{r}
+# initiate variable used data.frame ----
+used_vars <- as_tibble(years)
+# -----
+
+# family interview id ----
+psid_vars %>% filter(var_id == 8746) %>% count(text)
+fam_id_vars <- psid_vars %>% filter(var_id == 8746) %>% pull(variable)
+used_vars <- bind_cols(used_vars, fam_id_vars = fam_id_vars)
+# ----
+
+# family interview number ----
+psid_vars %>% filter(var_id == 419) %>% count(text)
+itw_num_vars <- psid_vars %>% filter(var_id == 419) %>% pull(variable)
+used_vars <- bind_cols(used_vars, itw_num_vars = itw_num_vars)
+# ----
+
+# relation to head ----
+psid_vars %>% filter(var_id == 422) %>% count(text)
+rel_head_vars <- psid_vars %>% filter(var_id == 422) %>% pull(variable)
+used_vars <- bind_cols(used_vars, rel_head_vars = rel_head_vars)
+# ----
+
+# obtain "head/reference and spouse taxable income" for all families
+# taxable income of head and wife ----
+psid_vars %>% filter(var_id == 5543) %>% count(text)
+tax_inc_vars <- psid_vars %>% filter(var_id == 5543) %>% pull(variable)
+used_vars <- bind_cols(used_vars, tax_inc_vars = tax_inc_vars)
+
+# accuracy of taxable income
+psid_vars %>% filter(var_id == 5541) %>% count(text)
+accu_tax_inc_vars <- psid_vars %>% filter(var_id == 5541) %>% pull(variable)
+used_vars <- bind_cols(used_vars, accu_tax_inc_vars = accu_tax_inc_vars)
+accu_tax_inc_vars <- accu_tax_inc_vars[!is.na(accu_tax_inc_vars)] # missing in a number of years
+# -----
+
+# total transfers of head and wife ----
+psid_vars %>% filter(var_id == 6669) %>% count(text)
+transfers_vars <- psid_vars %>% filter(var_id == 6669) %>% pull(variable)
+used_vars <- bind_cols(used_vars, transfers_vars = transfers_vars)
+transfers_vars <- transfers_vars[!is.na(transfers_vars)] # missing in 1968 and 1969
+# ----
+
+# head's labor income ----
+psid_vars %>% filter(var_id == 5643) %>% count(text)
+head_lab_inc_vars <- psid_vars %>% filter(var_id == 5643) %>% pull(variable)
+used_vars <- bind_cols(used_vars, head_lab_inc_vars = head_lab_inc_vars)
+# ----
+
+# accuracy of head's labor income ----
+psid_vars %>% filter(var_id == 5645) %>% count(text)
+accu_head_lab_inc_vars <- psid_vars %>% filter(var_id == 5645) %>% pull(variable)
+accu_head_lab_inc_vars[which(years %in% 1968:1969)] <- c("V85", "V515") # accuracy variables for 1968 and 1969 (no idea why they are not with the other values in the excel spredsheet)
+accu_head_lab_inc_vars[which(years %in% 1997:1999)] <- c("ER12081", "ER16464") # accuracy variables for 1997 and 1999
+used_vars <- bind_cols(used_vars, accu_head_lab_inc_vars = accu_head_lab_inc_vars)
+accu_head_lab_inc_vars <- accu_head_lab_inc_vars[!is.na(accu_head_lab_inc_vars)]
+# ----
+
+# wife labor income ----
+psid_vars %>% filter(var_id == 5750) %>% count(text)
+psid_vars %>% filter(var_id == 5766) %>% count(text)
+spouse_lab_inc_vars <- c(psid_vars %>% filter(var_id == 5750 & year < 1994) %>% pull(variable),
+                         psid_vars %>% filter(var_id == 5766 & year >= 1994) %>% pull(variable))
+used_vars <- bind_cols(used_vars, spouse_lab_inc_vars = spouse_lab_inc_vars)
+
+# accuracy wife labor income
+psid_vars %>% filter(var_id == 5745) %>% count(text)
+psid_vars %>% filter(var_id == 5751) %>% count(text)
+accu_spouse_lab_inc_vars <- c(psid_vars %>% filter(var_id == 5745 & year < 1994) %>% pull(variable),
+                              psid_vars %>% filter(var_id == 5751 & year >= 1994) %>% pull(variable))
+used_vars <- bind_cols(used_vars, accu_spouse_lab_inc_vars = accu_spouse_lab_inc_vars)
+accu_spouse_lab_inc_vars <- accu_spouse_lab_inc_vars[!is.na(accu_spouse_lab_inc_vars)]
+# ----
+
+# obtain income variables ----
+df_list <- ls(pattern = "fam_\\d")
+inc_all <- map_dfr(df_list,
+                   ~ get(.x) %>%
+                     mutate(year_psid = as.numeric(str_extract(.x, "\\d+")),
+                            year_inc = as.numeric(str_extract(.x, "\\d+")) - 1, # -1 because income reported in year n corresponds to income earned in year n - 1
+                            across(any_of(fam_id_vars), ~ .x, .names = "itw_num"),
+                            across(any_of(tax_inc_vars), ~ .x, .names = "family_tax_income"),
+                            across(any_of(accu_tax_inc_vars), ~ .x, .names = "accuracy_family_tax_income"),
+                            across(any_of(transfers_vars), ~ .x, .names = "family_transfers_income"),
+                            across(any_of(head_lab_inc_vars), ~ .x, .names = "head_labor_income"),
+                            across(any_of(accu_head_lab_inc_vars), ~ .x, .names = "accuracy_head_labor_income"),
+                            across(any_of(spouse_lab_inc_vars), ~ .x, .names = "wife_labor_income"),
+                            across(any_of(accu_spouse_lab_inc_vars), ~ .x, .names = "accuracy_wife_labor_income")) %>% 
+                     select(itw_num, year_psid, year_inc, family_tax_income, head_labor_income, wife_labor_income, any_of(c("family_transfers_income", "accuracy_family_tax_income", "accuracy_head_labor_income", "accuracy_wife_labor_income"))))
+setDT(inc_all)
+# ----
+
+inc_all %>% head
+
+# compute number of heads and wife/"wife" in household in each year ----
+# obtain long version of individual data with interview number and relation to household head
+ind_2019_long <- ind_2019 %>%
+  select(ind_id_68, gender, all_of(c(itw_num_vars, rel_head_vars))) %>%
+  rename_with(~ map2_chr(itw_num_vars, years, ~ paste0(.x, "_itw_", .y)), all_of(itw_num_vars)) %>%
+  rename_with(~ map2_chr(rel_head_vars, years, ~ paste0(.x, "_rel_", .y)), all_of(rel_head_vars)) %>%
+  pivot_longer(cols = -c(ind_id_68, gender),
+               names_to = c(".value", "year"),
+               names_pattern = ".(itw|rel)_(\\d+)") %>% 
+  rename(itw_num = itw,
+         rel_head = rel) %>% 
+  mutate(year = as.numeric(year)) %>% 
+  filter(substr(rel_head, 1, 1) != 0)
+
+# merge income data
+ind_2019_long <- ind_2019_long %>% 
+  left_join(inc_all %>% rename(year = year_psid))
+
+# compute number of household "adults"
+# equal 1 if only head
+# equal 2 if head + "wife"
+ind_2019_long <- ind_2019_long %>%
+  group_by(year, itw_num, head_labor_income, wife_labor_income) %>% 
+  summarise(n_adults = sum(substr(rel_head, 1, 1) %in% 1:2)) %>% 
+  ungroup()
+# 40.6% of observations are for households with only 1 "adult"
+ind_2019_long %>% count(n_adults) %>% count_to_pct()
+
+# add number of household "adults" to income data
+inc_all <- inc_all %>% 
+  left_join(ind_2019_long %>% select(year_psid = year, itw_num, n_adults))
+# ----
+
+# generate family labor income
+inc_all[, family_labor_income := head_labor_income + wife_labor_income]
+
+# generate family total income = family taxable income + transfers
+inc_all[, family_total_income := family_tax_income + family_transfers_income]
+# total income missing for 1968 and 1969 since no transfers variable available for these years
+inc_all %>% count(year_inc, is.na(family_total_income))
+
+# for 61.6% of cases, family taxable income = head labor income + wife labor income
+inc_all %>% count(family_tax_income == family_labor_income) %>% count_to_pct()
+# when there is a difference it is small
+inc_all %>%
+  filter(family_tax_income != 9999999 | family_labor_income != 19999998 | head_labor_income == 99999 | wife_labor_income == 99999) %>% 
+  mutate(diff = family_tax_income - family_labor_income) %>%
+  filter(abs(diff) <= 100000 & diff != 0) %>%
+  ggplot(aes(x = diff)) +
+  geom_histogram(binwidth = 1000)
+# 56.4% when only keeping non-zero family incomes
+inc_all[family_tax_income != 0] %>% count(family_tax_income == family_labor_income) %>% count_to_pct()
+
+# merge price level data
+inc_all <- inc_all %>% 
+  left_join(cpi_u %>% select(year_inc = year, base_2019))
+
+# generate real income variables (in 2019 dollars)
+inc_vars <- c("family_total_income", "family_tax_income", "family_transfers_income", "family_labor_income", "head_labor_income", "wife_labor_income")
+inc_all <- inc_all %>% 
+  mutate(across(all_of(inc_vars), ~ .x * (1 + base_2019), .names = "{.col}_real"))
+
+# generate income variables divided by number of adults in household
+inc_all <- inc_all %>% 
+  mutate(across(all_of(paste0(inc_vars, "_real")), ~ .x/n_adults, .names = "{.col}_n"))
+```
+
+## Display and export used variables
+
+```{r}
+used_vars
+fwrite(used_vars, here("data/used_vars_income_data.csv"))
+```
+
+## Export income dataset
+
+```{r}
+fwrite(inc_all, here("data/inc_all.csv"))
+```
+
+## Session info
+
+```{r}
+sessionInfo()
+```

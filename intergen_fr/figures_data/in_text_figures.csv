@@ -1,0 +1,20 @@
+Label,Figure,N
+farmer parent,0.0508086641504858,74248
+liberal parent,0.0241384015890104,74248
+Baseline FS R2 Mother,0.372164248500541,14735
+Baseline FS R2 Father,0.358085263139234,15583
+Baseline FS R2 Pooled,0.461175294439348,30318
+Observed educ,0.862910594539344,64571
+No geo FS R2 Mother,0.362051991840615,14735
+No geo FS R2 Father,0.347869443276532,15583
+No geo FS R2 Pooled,0.452533331461556,30318
+Min cor dep with/out geo,0.96865668229275,85
+%movers all,0.407892087779344,64571
+% movers F,0.413454058931516,32139
+% movers M,0.402380365071534,32432
+dep rank Medium n_dep,21,85
+dep rank Low n_dep,70,85
+dep rank High n_dep,6,85
+dep rank Medium share_movers,0.333168805528134,8775
+dep rank Low share_movers,0.489824588047688,12901
+dep rank High share_movers,0.177006606424178,4662
